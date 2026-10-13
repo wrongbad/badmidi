@@ -9,7 +9,7 @@ from fractions import Fraction
 from . import perform
 from .score import Score
 
-PPQ = 480  # ticks per quarter note; divisible by 3 so triplets are exact
+PPQ = 960  # ticks per quarter note; divisible by 3 and 5, so triplets and quintuplets are exact
 
 
 def _vlq(n: int) -> bytes:
@@ -36,13 +36,27 @@ def _track(events: list[tuple[int, int, bytes]]) -> bytes:
     return b"MTrk" + len(body).to_bytes(4, "big") + bytes(body)
 
 
+def _time_signature(m) -> bytes | None:
+    """A time-signature meta event; a free bar gets the plain signature of its
+    length (11 quarters -> 11/4) if it has one."""
+    num, den = m.num, m.den
+    if m.free is not None:
+        den = next((d for d in (4, 8, 16, 32) if (m.free * d / 4).denominator == 1), None)
+        if den is None or m.free * den / 4 > 255:
+            return None
+        num = int(m.free * den / 4)
+    return _meta(0x58, bytes([num, den.bit_length() - 1, 24, 8]))
+
+
 def midi_bytes(score: Score) -> bytes:
-    num, den = score.meter
     conductor = [
         (0, 0, _meta(0x03, (score.title or "badmidi").encode())),
-        (0, 0, _meta(0x58, bytes([num, den.bit_length() - 1, 24, 8]))),
         (0, 0, _meta(0x59, bytes([score.key.signature & 0xFF, 1 if score.key.minor else 0]))),
     ]
+    for bar, m in score.meter_changes(score.bars):
+        sig = _time_signature(m)
+        if sig:
+            conductor.append((round(score.bar_start(bar) * PPQ), 0, sig))
     for t, bpm in perform.tempo_map(score):
         conductor.append((round(t * PPQ), 1, _meta(0x51, round(60_000_000 / bpm).to_bytes(3, "big"))))
     tracks = [_track(conductor)]

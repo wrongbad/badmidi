@@ -147,8 +147,8 @@ METRIC = (4, 2)               # extra velocity on downbeats, on other beats
 
 
 def velocity(dyn: Dynamics, part, t: Fraction, note: Note) -> int:
-    sc = part.score
-    metric = METRIC[0] if t % sc.bar_len == 0 else METRIC[1] if t % sc.beat_len == 0 else 0
+    level = part.score.metric_level(t)
+    metric = METRIC[0] if level == 3 else METRIC[1] if level >= 0 else 0
     v = dyn.level(t) + part.balance + dyn.sforzandi.get(t, 0) + metric
     v += max((ACCENT.get(c, 0) for c in note.art), default=0)
     return max(1, min(127, round(v)))

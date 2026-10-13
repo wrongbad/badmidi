@@ -30,7 +30,8 @@ is no sustain pedal; a note lasts while it's held. The registers are the
 accordion's reed ranks (L = 16', M = 8', H = 4'); they print as
 registration marks and play back as a reed organ.
 
-    badmidi examples/hexachord_fantasia.py grid --bars 9-22
+    badmidi examples/hexachord_fantasia.py grid --bars 9-22     # augmented triads, (048)
+    badmidi examples/hexachord_fantasia.py lens --bars 1-8      # the canon's passing notes and suspensions
     badmidi examples/hexachord_fantasia.py pdf
 """
 from badmidi import *
@@ -50,8 +51,7 @@ rh.balance = 6
 # --- the material --------------------------------------------------------------
 
 ut_re_mi = M("C3.w D3.w E3.w F3.w G3.w A3.w")             # hexachord naturale
-complement = M("Fs3.w Gs3.w As3.w B3.w Cs4.w Ds4.w")       # the same steps a tritone higher
-assert complement == ut_re_mi.transpose(6)
+complement = ut_re_mi.transpose(6)                         # F# G# A# B C# D#
 
 # I. a line over the rising-third sequence; the harmony of each bar is the
 # previous bar's a step higher, so the line answers itself in canon one bar
@@ -61,17 +61,11 @@ canon_7 = soggetto.transpose(1, scale=F).octave(-1)
 
 # II. subject on C, answer on F#; the countersubject fits both
 subject = M("C3.h G3.q A3.q | F3.qd E3.e D3.e E3.e C3.q |")
-answer = M("Fs3.h Cs4.q Ds4.q | B3.qd As3.e Gs3.e As3.e Fs3.q |")
+answer = subject.transpose(6)                                    # F# C# D# | B A# G# A# F#
 counter = M("D3.q E3.q A2.q G2.q~ | G2.q D3.q E3.q D3.q |")
-counter_on_Fs = M("Gs3.q As3.q Ds3.q Cs3.q~ | Cs3.q Gs3.q As3.q Gs3.q |")
-rovescio = M("A4.h D4.q C4.q | E4.qd F4.e G4.e F4.e A4.q |")      # C<->A, D<->G, E<->F
-assert answer == subject.transpose(6) and counter_on_Fs == counter.transpose(6)
-assert rovescio == subject.octave(1).invert(around=A4).transpose(-9)
+counter_on_Fs = counter.transpose(6)
+rovescio = subject.octave(1).invert(around=A4).transpose(-9)     # C<->A, D<->G, E<->F
 
-
-def offbeat(m):
-    """The notes without their barlines, for an entry that starts mid-bar."""
-    return M(*m.notes)
 
 # --- I. Intonatio ----------------------------------------------------------------
 
@@ -89,8 +83,8 @@ rh.at(13, subject.octave(2), counter.octave(2), Bar(17))
 
 # stretto: subject, answer half a bar behind, the subject inverted a bar behind
 rh.at(17, subject.octave(2), "Gs4.q A4.q B4.h | A4.h Bb4.h | D5.w | Cs5.w@ |23")
-bass.at(17, "R.h", offbeat(answer.octave(-1)), "E2.h | Fs2.h G2.h | Bb1.w | A1.w@ |23")
-lh.at(17, "A3.h", offbeat(counter.octave(1)), "G3.h | A3.h G3.h | D3.w | E3.w@ |23")
+bass.at(17, answer.octave(-1), "E2.h | Fs2.h G2.h | Bb1.w | A1.w@ |23", beat=3)
+lh.at(17, "A3.h", counter.octave(1), "G3.h | A3.h G3.h | D3.w | E3.w@ |23")
 alto.at(18, rovescio, "D4.w | G4.w | A4.w@ |23")
 
 # --- III. Divisions on a ground ---------------------------------------------------

@@ -108,7 +108,8 @@ class Scale:
 
     def at(self, index: int, alter: int = 0) -> Pitch:
         octave, i = divmod(index, len(self.steps))
-        return Pitch(self.tonic + 12 * octave + self.steps[i] + alter)
+        midi = self.tonic + 12 * octave + self.steps[i] + alter
+        return Pitch(midi, self.names[midi % 12])        # spelled as this scale spells it
 
     def step(self, p: Pitch, n: int) -> Pitch:
         """Move a pitch n scale steps (keeping any chromatic alteration)."""

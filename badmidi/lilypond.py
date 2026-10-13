@@ -8,19 +8,19 @@ and rit./accel. spanners above the top staff.
 """
 from __future__ import annotations
 
+import bisect
 import os
 import shutil
 import subprocess
 from fractions import Fraction
 
-from .core import Mark, Note, octave_of, pc_name, spelling
+from .core import Mark, Note, fmt_number, octave_of, pc_name, spelling, tuplet_space
 from .midi import read_notes
 from .score import Part, Score
 
 PLAIN = {Fraction(4, 2 ** k): str(2 ** k) for k in range(6)}          # 4 -> "1" ... 1/8 -> "32"
 DOTTED = {d * Fraction(3, 2): s + "." for d, s in PLAIN.items()}
 NORMAL = dict(sorted({**PLAIN, **DOTTED}.items(), reverse=True))
-TRIPLET = dict(sorted({d * Fraction(2, 3): s for d, s in PLAIN.items()}.items(), reverse=True))
 ARTICULATION = {">": "->", "^": "-^", "'": "-.", "_": "--", "@": "\\fermata"}
 MODES = {"major": "major", "minor": "minor", "harmonic minor": "minor", "melodic minor": "minor",
          "dorian": "dorian", "phrygian": "phrygian", "lydian": "lydian",
@@ -43,19 +43,31 @@ def _whole(d: Fraction) -> str:
     return "1" if w == 1 else f"1*{w.numerator}/{w.denominator}"
 
 
-def _split(d: Fraction) -> list[tuple[Fraction, str, bool]]:
-    """Break a length into printable values: (length, lily duration, is_triplet)."""
-    table, trip = (TRIPLET, True) if (d * 3).denominator & ((d * 3).denominator - 1) == 0 and d.denominator % 3 == 0 \
-        else (NORMAL, False)
-    out = []
-    while d > 0:
-        for v, s in table.items():
-            if v <= d:
-                out.append((v, s, trip))
-                d -= v
+def _tuplet(d: Fraction) -> tuple[int, int] | None:
+    """(n, space) of the tuplet a length belongs to: the odd part of its
+    denominator, in the time of the power of two below it. 1/3 -> (3, 2),
+    2/5 -> (5, 4), 1/7 -> (7, 4); None for plain and dotted values."""
+    q = d.denominator
+    while q % 2 == 0:
+        q //= 2
+    return None if q == 1 else (q, tuplet_space(q))
+
+
+def _split(d: Fraction, written_as=None) -> list[tuple[Fraction, str, tuple[int, int] | None]]:
+    """Break a length into printable values: (length, lily duration, tuplet).
+    Inside a tuplet the written values are the sounding ones scaled by n/space.
+    written_as is the note's own ratio (5, 3), used when it fits the length."""
+    tup = written_as if written_as and d * Fraction(*written_as) in NORMAL else _tuplet(d)
+    scale = Fraction(tup[0], tup[1]) if tup else Fraction(1)
+    written, out = d * scale, []
+    while written > 0:
+        for v, s in NORMAL.items():
+            if v <= written:
+                out.append((v / scale, s, tup))
+                written -= v
                 break
-        else:  # not expressible with plain, dotted or triplet values: scale the duration
-            out.append((d, f"4*{d.numerator}/{d.denominator}", False))
+        else:  # not expressible with plain or dotted values: scale the duration
+            out.append((written / scale, f"4*{d.numerator}/{d.denominator}", None))
             break
     return out
 
@@ -83,10 +95,12 @@ def _ottavas(score: Score, part: Part, nbars: int, clef: str) -> list[int]:
     shifts = [0] * nbars
     if rule is None:
         return shifts
-    bl = score.bar_len
+    starts = score.barlines(nbars)
     ranges: list[list[int]] = [[] for _ in range(nbars)]
     for t, n in part.events(merge_ties=False):
-        for b in range(int(t // bl), min(nbars, int(-(-(t + n.dur) // bl)))):
+        first = bisect.bisect_right(starts, t) - 1
+        last = bisect.bisect_left(starts, t + n.dur) - 1
+        for b in range(first, min(nbars, last + 1)):
             ranges[b].extend(p.midi for p in n.pitches)
     return [rule(min(r), max(r)) if r else 0 for r in ranges]
 
@@ -95,8 +109,8 @@ def _voice(score: Score, part: Part, nbars: int, primary: bool, clef: str | None
     """One voice as LilyPond music, with a bar check after every bar.
     Gaps print as rests in a staff's first voice and as invisible spacers in
     the others. With a clef, bars far off the staff get an ottava sign."""
-    bl = score.bar_len
-    total = nbars * bl
+    starts = score.barlines(nbars)
+    total = starts[-1]
     timeline: list[tuple[Fraction, Fraction, Note | None]] = []
     cur = Fraction(0)
     for t, n in part.events(merge_ties=False):
@@ -107,19 +121,19 @@ def _voice(score: Score, part: Part, nbars: int, primary: bool, clef: str | None
     if cur < total:
         timeline.append((cur, total - cur, None))
 
-    bars: list[list[tuple[str, bool]]] = [[] for _ in range(nbars)]   # (token, is_triplet)
+    bars: list[list[tuple[str, tuple | None]]] = [[] for _ in range(nbars)]   # (token, (tuplet, length))
     for start, dur, note in timeline:
         s, left = start, dur
         while left > 0:
-            b = int(s // bl)
-            seg = min(left, (b + 1) * bl - s)
+            b = bisect.bisect_right(starts, s) - 1
             if b >= nbars:
                 break
-            if note is None and seg == bl:
+            seg = min(left, starts[b + 1] - s)
+            if note is None and seg == starts[b + 1] - starts[b]:
                 bars[b].append((("R" if primary else "s") + _whole(seg), False))
             else:
-                pieces = _split(seg)
-                for i, (v, ly, trip) in enumerate(pieces):
+                pieces = _split(seg, note.tuplet if note is not None else None)
+                for i, (v, ly, tup) in enumerate(pieces):
                     first = s == start and i == 0
                     last = seg == left and i == len(pieces) - 1
                     if note is None:
@@ -133,7 +147,7 @@ def _voice(score: Score, part: Part, nbars: int, primary: bool, clef: str | None
                         arts = "".join(ARTICULATION[c] for c in note.art
                                        if (c == "@" and last) or (c != "@" and first))
                         tok = head + ly + tie + arts
-                    bars[b].append((tok, v if trip else False))   # a triplet carries its length
+                    bars[b].append((tok, (tup, v) if tup else None))
             s += seg
             left -= seg
 
@@ -144,21 +158,29 @@ def _voice(score: Score, part: Part, nbars: int, primary: bool, clef: str | None
         if shifts[b] != shift:
             shift = shifts[b]
             words.append(f"\\ottava #{shift}")
-        held = Fraction(0)
-        for tok, trip in bar + [("", False)]:
-            if trip:
-                # one bracket per beat's worth, not one across a whole run
-                run.append(tok)
-                held += trip
-                if held.denominator == 1:
-                    words.append("\\tuplet 3/2 { " + " ".join(run) + " }")
-                    run, held = [], Fraction(0)
-                continue
+        held, kind = Fraction(0), None
+
+        def close():
+            nonlocal run, held
             if run:
-                words.append("\\tuplet 3/2 { " + " ".join(run) + " }")
-                run, held = [], Fraction(0)
-            if tok:
-                words.append(tok)
+                words.append(f"\\tuplet {kind[0]}/{kind[1]} {{ " + " ".join(run) + " }")
+            run, held = [], Fraction(0)
+        for tok, tup in bar + [("", None)]:
+            if tup and tup[0] == kind:
+                run.append(tok)
+            elif tup:
+                close()
+                kind, run = tup[0], [tok]
+            else:
+                close()
+                kind = None
+                if tok:
+                    words.append(tok)
+                continue
+            # one bracket per beat's worth, not one across a whole run
+            held += tup[1]
+            if held.denominator == 1:
+                close()
         out.append(" ".join(words) + " |")
     return "\n    ".join(out)
 
@@ -278,14 +300,46 @@ def _tempo_line(score: Score, total: Fraction) -> str:
 # --- the whole score -----------------------------------------------------------
 
 
+def _global_time(score: Score, nbars: int) -> str:
+    """Time signatures and the bars' lengths as spacers. A free bar is an
+    irregular measure with no time signature, breakable at every beat."""
+    starts = score.barlines(nbars)
+    out: list[str] = []
+    prev, run = None, Fraction(0)          # run: length of metered bars not yet written
+    for b in range(1, nbars + 1):
+        m = score.meter_at(b)
+        if m.free is None and m == prev:
+            run += starts[b] - starts[b - 1]
+            continue
+        if run:
+            out.append(f"s{_whole(run)}")
+            run = Fraction(0)
+        if m.free is None:
+            if m.explicit:     # printed as 2+2+3 over 8, beamed in those groups
+                out.append(f"\\compoundMeter #'(({' '.join(map(str, m.groups))} {m.den}))")
+            else:
+                out.append(f"\\time {m.num}/{m.den}")
+            run = starts[b] - starts[b - 1]
+        else:
+            if b == 1:
+                out.append("\\once \\omit Staff.TimeSignature")
+            w = m.free / 4
+            out.append(f"\\set Timing.measureLength = #(ly:make-moment {w.numerator}/{w.denominator})")
+            beats, rest = int(m.free), m.free - int(m.free)
+            out.append(" \\bar \"\" ".join(["s4"] * beats + ([f"s{_whole(rest)}"] if rest else [])))
+        prev = m
+    if run:
+        out.append(f"s{_whole(run)}")
+    return " ".join(out)
+
+
 def lilypond(score: Score) -> str:
     nbars = score.bars
-    total = nbars * score.bar_len
+    total = score.barlines(nbars)[-1]
     k = score.key
     with spelling(k):
         tonic = _pitch_name_only(k.tonic_name)
-        glob = (f"\\key {tonic} \\{MODES[k.mode]} \\time {score.meter[0]}/{score.meter[1]} "
-                f"s{_whole(total)} \\bar \"|.\"")
+        glob = f"\\key {tonic} \\{MODES[k.mode]} {_global_time(score, nbars)} \\bar \"|.\""
 
         # staves in score order; each staff = parts sharing .staff
         staves: list[tuple[str, list[Part]]] = []
@@ -406,24 +460,32 @@ def verify(score: Score, engraved_midi: bytes) -> list[str]:
     # LilyPond's MIDI plays staccato notes short, so those match on onset and pitch only
     short = {(t, p.midi) for part in score.parts for t, n in part.events() if "'" in n.art for p in n.pitches}
 
+    # LilyPond writes ticks rounded down at its own resolution, so tuplets
+    # that resolution can't hold (quintuplets at 384 per quarter) are compared there
+    ppq = int.from_bytes(engraved_midi[12:14], "big")
+
     def key(t, m, d):
-        return (t, m, None) if (t, m) in short else (t, m, d)
+        tick, length = int(t * ppq), int(d * ppq)
+        return (tick, m, None) if (t, m) in short else (tick, m, length)
     want = Counter(key(*n) for n in score_notes(score))
     got = Counter(key(*n) for n in read_notes(engraved_midi))
     problems = []
     for label, diff in (("missing from the engraving", want - got), ("extra in the engraving", got - want)):
-        for (t, m, d), n in sorted(diff.items(), key=lambda x: (x[0][0], x[0][1])):
-            length = "staccato" if d is None else f"{d} quarters"
+        for (tick, m, ticks), n in sorted(diff.items(), key=lambda x: (x[0][0], x[0][1])):
+            t = Fraction(tick, ppq)
+            length = "staccato" if ticks is None else f"{fmt_number(Fraction(ticks, ppq))} quarters"
             problems.append(f"{label}: {Pitch(m)} at {fmt_pos(score, t)}, {length}" + (f" (x{n})" if n > 1 else ""))
     return problems
 
 
-def engrave(score: Score, path: str, fmt: str = "pdf", strict: bool = True) -> str:
-    """Write <stem>.ly next to `path` and render it with LilyPond to pdf or png.
+def engrave(score: Score, path: str, fmt: str = "pdf", strict: bool = True, keep_ly: bool = False) -> str:
+    """Render the score with LilyPond to pdf or png at `path`.
 
     Then prove the engraving: LilyPond also writes MIDI from the same source,
     and every note in it must match the score exactly (pitch, onset, length).
-    With strict, any LilyPond warning is an error too. Returns LilyPond's log."""
+    With strict, any LilyPond warning is an error too. The LilyPond source
+    (<stem>.ly) is left next to the output only if something went wrong, or
+    with keep_ly. Returns LilyPond's log."""
     exe = shutil.which("lilypond")
     if not exe:
         raise FileNotFoundError("lilypond not found (brew install lilypond)")
@@ -433,6 +495,8 @@ def engrave(score: Score, path: str, fmt: str = "pdf", strict: bool = True) -> s
     args = [exe, "-s", "-o", stem]
     args += ["--png", "-dresolution=110"] if fmt == "png" else ["--pdf"]
     r = subprocess.run(args + [stem + ".ly"], capture_output=True, text=True)
+    if os.path.exists(stem + ".midi") and r.returncode != 0:
+        os.remove(stem + ".midi")
     if r.returncode != 0:
         raise EngraveError(f"lilypond failed:\n{r.stderr}")
     warnings = [line for line in r.stderr.splitlines() if "warning:" in line or "error:" in line]
@@ -443,6 +507,8 @@ def engrave(score: Score, path: str, fmt: str = "pdf", strict: bool = True) -> s
         problems = verify(score, f.read())
     os.remove(midi_path)
     if problems:
-        raise EngraveError(f"the engraving does not match the score ({len(problems)} differences):\n"
-                           + "\n".join(problems[:20]))
+        raise EngraveError(f"the engraving does not match the score ({len(problems)} differences; "
+                           f"see {stem}.ly):\n" + "\n".join(problems[:20]))
+    if not keep_ly:
+        os.remove(stem + ".ly")
     return r.stderr

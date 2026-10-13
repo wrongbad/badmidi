@@ -1,6 +1,7 @@
 """Scores and parts: placing motifs at explicit bar/beat anchors."""
 from __future__ import annotations
 
+import bisect
 from fractions import Fraction
 
 from .core import Bar, Mark, Motif, Note, Pitch, as_pitch
@@ -26,6 +27,101 @@ INSTRUMENTS: dict[str, tuple[int, int, int]] = {
 
 def _exact(x) -> Fraction:
     return Fraction(x).limit_denominator(192) if isinstance(x, float) else Fraction(x)
+
+
+class Meter:
+    """A time signature: Meter(3, 4); Meter(7, 8, groups=(2, 2, 3)); or from
+    text, Meter.parse("3/4"), Meter.parse("2+2+3/8"). A free (unmetered) bar
+    has a length in quarter notes and no time signature: Meter.free(11).
+
+    groups are how the beats gather into pulses. They default to threes for
+    compound meters (6/8, 9/8, 12/8, 6/4) and to single beats otherwise.
+    """
+
+    def __init__(self, num: int, den: int, groups: tuple[int, ...] | None = None,
+                 free: Fraction | None = None):
+        if free is None and (num < 1 or den < 1 or den & (den - 1)):
+            raise ValueError(f"bad meter {num}/{den}: the denominator must be a power of two")
+        if groups is not None and sum(groups) != num:
+            raise ValueError(f"meter groups {'+'.join(map(str, groups))} don't add up to {num}")
+        self.num, self.den, self.free = num, den, free
+        self.explicit = groups is not None
+        if groups is None:
+            groups = (3,) * (num // 3) if self.compound else (1,) * num
+        self.groups = tuple(groups)
+
+    @classmethod
+    def parse(cls, spec) -> "Meter":
+        if isinstance(spec, Meter):
+            return spec
+        if isinstance(spec, str):
+            top, _, den = spec.replace(" ", "").partition("/")
+            groups = tuple(int(g) for g in top.split("+"))
+            return cls(sum(groups), int(den), groups if len(groups) > 1 else None)
+        if len(spec) == 3:
+            return cls(spec[0], spec[1], tuple(spec[2]))
+        return cls(*spec)
+
+    @classmethod
+    def unmetered(cls, length) -> "Meter":
+        length = _exact(length)
+        if length <= 0:
+            raise ValueError("a free bar needs a positive length in quarter notes")
+        return cls(0, 4, (), free=length)
+
+    @property
+    def compound(self) -> bool:
+        return self.free is None and self.num in (6, 9, 12) and self.den >= 4
+
+    @property
+    def bar_len(self) -> Fraction:
+        return self.free if self.free is not None else Fraction(4 * self.num, self.den)
+
+    @property
+    def beat_len(self) -> Fraction:
+        return Fraction(1) if self.free is not None else Fraction(4, self.den)
+
+    @property
+    def beats(self) -> int:
+        """Beats in the bar (quarter notes in a free bar)."""
+        return self.num if self.free is None else int(-(-self.free // 1))
+
+    def pulses(self) -> list[Fraction]:
+        """Offsets of the pulses (group starts) within the bar."""
+        out, at = [], 0
+        for g in self.groups:
+            out.append(at * self.beat_len)
+            at += g
+        return out or [Fraction(0)]
+
+    def strong(self) -> list[Fraction]:
+        """Accented offsets: the downbeat, and the other pulses in additive,
+        compound or half-note meters; beat 3 of a four-beat bar."""
+        p = self.pulses()
+        if self.free is not None:
+            return [Fraction(0)]
+        if self.explicit or self.compound or self.beat_len >= 2:
+            return p
+        if len(p) == 4:
+            return [p[0], p[2]]
+        return [p[0]]
+
+    @property
+    def text(self) -> str:
+        if self.free is not None:
+            return "free"
+        top = "+".join(map(str, self.groups)) if self.explicit else str(self.num)
+        return f"{top}/{self.den}"
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, Meter) and (self.num, self.den, self.groups, self.free, self.explicit) == \
+            (other.num, other.den, other.groups, other.free, other.explicit)
+
+    def __hash__(self) -> int:
+        return hash((self.num, self.den, self.groups, self.free))
+
+    def __repr__(self) -> str:
+        return f"Meter.unmetered({self.free})" if self.free is not None else f"Meter.parse({self.text!r})"
 
 
 class Part:
@@ -75,17 +171,29 @@ class Part:
         self._last_end = Fraction(0)
 
     def at(self, bar: int, *material, beat=1) -> "Part":
-        start = self.score.time(bar, beat)
-        motif = Motif(*material)
-        self.placements.append((start, motif))
-        self._last_end = start + motif.dur
-        return self
+        return self._place(self.score.time(bar, beat), material)
 
     def then(self, *material) -> "Part":
-        motif = Motif(*material)
-        self.placements.append((self._last_end, motif))
-        self._last_end += motif.dur
+        return self._place(self._last_end, material)
+
+    def _place(self, t: Fraction, material) -> "Part":
+        # one placement per argument: check() treats a motif that enters
+        # mid-bar on its own terms (see views._enters_mid_bar)
+        for m in material:
+            motif = Motif(m)
+            self.placements.append((t, motif))
+            t += motif.dur
+        self._last_end = t
         return self
+
+    def voice(self, name: str, **kw) -> "Part":
+        """Another line on this part's staff, with the same instrument, group,
+        range and MIDI channel: rh.voice("alto"). A part holds one line, so
+        this is how a staff gets two voices that overlap. Keywords override."""
+        opts = dict(program=self.program, range=self.range, group=self.group, staff=self.staff,
+                    brace=self.brace, couplers=self.couplers, channel=self.channel, pan=self.pan)
+        opts.update(kw)
+        return self.score.part(name, self.instrument, **opts)
 
     def registration(self, bar: int, text: str, program: int | str | None = None, beat=1) -> "Part":
         """A registration change, printed above the staff ("Sw.: Flutes 8' 4'").
@@ -177,12 +285,16 @@ class Score:
     changes go through tempo_mark(), rit() and accel().
     """
 
-    def __init__(self, title: str = "", meter: tuple[int, int] = (4, 4),
+    def __init__(self, title: str = "", meter=(4, 4),
                  tempo: float = 100, key: str | Scale = "C major",
                  tempo_text: str | None = None, composer: str | None = None):
         self.title = title
         self.composer = composer
-        self.meter = meter
+        first = Meter.parse(meter)
+        self.meter = (first.num, first.den)     # the opening time signature
+        self._meters: dict[int, Meter] = {1: first}
+        self._free: dict[int, Meter] = {}
+        self._starts: list[Fraction] = [Fraction(0)]   # bar -> start time, extended on demand
         self.tempo = tempo
         self.key = parse_key(key)
         self.parts: list[Part] = []
@@ -242,29 +354,92 @@ class Score:
                 return p
         raise KeyError(name)
 
+    # --- meter ------------------------------------------------------
+
+    def meter_change(self, bar: int, meter) -> "Score":
+        """A new time signature from bar N on: (3, 4), "3/4", "2+2+3/8"."""
+        self._meters[bar] = Meter.parse(meter)
+        self._starts = [Fraction(0)]
+        return self
+
+    def free_bar(self, bar: int, length) -> "Score":
+        """Bar N is unmetered: no time signature, `length` quarter notes long
+        (a cadenza, an unmeasured prelude). The meter resumes after it.
+        Long free bars may break across lines at any beat."""
+        self._free[bar] = Meter.unmetered(length)
+        self._starts = [Fraction(0)]
+        return self
+
+    def meter_at(self, bar: int) -> Meter:
+        if bar in self._free:
+            return self._free[bar]
+        return self._meters[max(b for b in self._meters if b <= max(bar, 1))]
+
     # --- time ---------------------------------------------------------------
 
     @property
     def bar_len(self) -> Fraction:
-        return Fraction(4 * self.meter[0], self.meter[1])
+        """Length of a bar in the opening meter (see meter_at for the others)."""
+        return self.meter_at(1).bar_len
 
     @property
     def beat_len(self) -> Fraction:
-        return Fraction(4, self.meter[1])
+        return self.meter_at(1).beat_len
+
+    def bar_start(self, bar: int) -> Fraction:
+        """Absolute time of the start of bar N."""
+        while len(self._starts) < bar:
+            n = len(self._starts)                  # bar n's start is known; add bar n+1's
+            self._starts.append(self._starts[-1] + self.meter_at(n).bar_len)
+        return self._starts[bar - 1]
 
     def time(self, bar: int, beat=1) -> Fraction:
-        """Absolute time (in quarter notes) of bar N, beat B (both 1-based)."""
+        """Absolute time (in quarter notes) of bar N, beat B (both 1-based).
+        In a free bar a beat is a quarter note."""
         beat = _exact(beat)
         if bar < 1 or beat < 1:
             raise ValueError(f"bars and beats are numbered from 1 (got bar {bar}, beat {beat})")
-        if beat >= self.meter[0] + 1:
-            raise ValueError(f"beat {beat} is past the end of a {self.meter[0]}/{self.meter[1]} bar")
-        return (bar - 1) * self.bar_len + (beat - 1) * self.beat_len
+        m = self.meter_at(bar)
+        if (beat - 1) * m.beat_len >= m.bar_len:
+            raise ValueError(f"beat {beat} is past the end of bar {bar} ({m.text})")
+        return self.bar_start(bar) + (beat - 1) * m.beat_len
 
     def position(self, t: Fraction) -> tuple[int, Fraction]:
         """Inverse of time(): (bar, beat) for an absolute time."""
-        bar = int(t // self.bar_len)
-        return bar + 1, (t - bar * self.bar_len) / self.beat_len + 1
+        while self._starts[-1] <= t:
+            self.bar_start(len(self._starts) + 1)
+        bar = bisect.bisect_right(self._starts, t)
+        return bar, (t - self._starts[bar - 1]) / self.meter_at(bar).beat_len + 1
+
+    def is_barline(self, t: Fraction) -> bool:
+        return t == self.bar_start(self.position(t)[0])
+
+    def barlines(self, nbars: int) -> list[Fraction]:
+        """Start times of bars 1..nbars+1 (the last is where bar nbars ends)."""
+        self.bar_start(nbars + 1)
+        return self._starts[:nbars + 1]
+
+    def metric_level(self, t: Fraction) -> int:
+        """3 downbeat, 2 other strong beat, 1 other pulse, 0 other beat, -1 between beats."""
+        bar, _ = self.position(t)
+        m, off = self.meter_at(bar), t - self.bar_start(bar)
+        if off == 0:
+            return 3
+        if off in m.strong():
+            return 2
+        if off in m.pulses():
+            return 1
+        return 0 if off % m.beat_len == 0 else -1
+
+    def meter_changes(self, nbars: int) -> list[tuple[int, Meter]]:
+        """(bar, meter) for bar 1 and every bar whose meter differs from the
+        bar before it, up to nbars."""
+        out: list[tuple[int, Meter]] = []
+        for b in range(1, nbars + 1):
+            m = self.meter_at(b)
+            if not out or m != out[-1][1]:
+                out.append((b, m))
+        return out
 
     def where(self, t: Fraction) -> str:
         from .views import fmt_pos
@@ -276,7 +451,8 @@ class Score:
 
     @property
     def bars(self) -> int:
-        return max(1, -(-self.end // self.bar_len))
+        bar, beat = self.position(self.end)
+        return max(1, bar - 1 if beat == 1 else bar)
 
     def seconds(self, t: Fraction) -> float:
         from .perform import tempo_map, seconds_at
@@ -292,6 +468,11 @@ class Score:
         from .views import grid
         return grid(self, **kw)
 
+    def observe(self, parts=None):
+        """What the voices are doing: analysis.observe()."""
+        from .analysis import observe
+        return observe(self, parts)
+
     def check(self, **kw) -> str:
         from .views import check
         return check(self, **kw)
@@ -303,6 +484,10 @@ class Score:
     def render_wav(self, path: str, soundfont: str | None = None) -> None:
         from .render import render_wav
         render_wav(self, path, soundfont)
+
+    def lens(self, **kw) -> str:
+        from .views import lens
+        return lens(self, **kw)
 
     def lilypond(self) -> str:
         from .lilypond import lilypond

@@ -42,7 +42,8 @@ def octave_of(midi: int, name: str) -> int:
     return (midi - alter - LETTERS[name[0]]) // 12 - 1
 
 
-# Durations in quarter notes. Suffix "d" = dotted, "3" = triplet.
+# Durations in quarter notes. Suffix "d" = dotted, "3" = triplet. Any other
+# tuplet is spelled the same way (see duration()): e5, s7, q5:3.
 DURATIONS: dict[str, Fraction] = {
     "w": Fraction(4), "h": Fraction(2), "q": Fraction(1), "e": Fraction(1, 2),
     "s": Fraction(1, 4), "t": Fraction(1, 8),
@@ -50,6 +51,62 @@ DURATIONS: dict[str, Fraction] = {
     "h3": Fraction(4, 3), "q3": Fraction(2, 3), "e3": Fraction(1, 3), "s3": Fraction(1, 6),
 }
 DURATION_CODES = {v: k for k, v in DURATIONS.items()}
+BASE_VALUES = {k: DURATIONS[k] for k in "whqest"}
+_CODE = re.compile(r"([whqest])(d?)(?:(\d+)(?::(\d+))?)?")
+
+
+def tuplet_space(n: int) -> int:
+    """How many notes an n-tuplet takes the place of, by default: the power
+    of two below n (3 in the time of 2, 5 or 7 in the time of 4, 9 of 8).
+    A power of two itself (a duplet in 6/8) needs its ratio spelled: q2:3."""
+    return 1 << (n.bit_length() - 1)
+
+
+def duration(code: str) -> Fraction:
+    """A duration code in quarter notes: q, qd (dotted), e3 (triplet eighth),
+    s5 (quintuplet sixteenth: five in the time of four), e7 (seven in the
+    time of four), q5:3 (five in the time of three), q2:3 (a duplet in 6/8)."""
+    return _duration(code)[0]
+
+
+WRITTEN = {d for k, d in DURATIONS.items() if "3" not in k}     # plain and dotted values
+
+
+def _tuplet_ok(dur: Fraction, tuplet) -> bool:
+    """Is dur one plain or dotted value under this tuplet ratio?"""
+    return tuplet is not None and dur * Fraction(tuplet[0], tuplet[1]) in WRITTEN
+
+
+def _duration(code: str) -> tuple[Fraction, tuple[int, int] | None]:
+    """(length, tuplet ratio as written or None)."""
+    if code in DURATIONS:
+        m = _CODE.fullmatch(code)
+        return DURATIONS[code], ((int(m[3]), tuplet_space(int(m[3]))) if m and m[3] else None)
+    m = _CODE.fullmatch(code)
+    if not m:
+        raise ValueError(f"unknown duration .{code}; e.g. q qd e3 s5 e7 q5:3")
+    base, dot, n, space = m.groups()
+    d = BASE_VALUES[base] * (Fraction(3, 2) if dot else 1)
+    if n is None:
+        return d, None
+    n = int(n)
+    if not space and n & (n - 1) == 0:
+        raise ValueError(f"bad tuplet .{code}: say what {n} notes take the time of, e.g. .{base}{dot}{n}:3")
+    space = int(space) if space else tuplet_space(n)
+    if n < 2 or space < 1 or n == space:
+        raise ValueError(f"bad tuplet .{code}: {n} in the time of {space}")
+    return d * Fraction(space, n), (n, space)
+
+
+_TUPLET_CODES: dict[Fraction, str] = {}
+for _n in (3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15):      # first spelling wins: s3 before e6
+    for _b in "whqest":
+        _TUPLET_CODES.setdefault(duration(f"{_b}{_n}"), f"{_b}{_n}")
+for _n in range(2, 16):                                 # then explicit ratios: q5:3
+    for _sp in range(1, 16):
+        for _b in "whqest":
+            if _sp != _n:
+                _TUPLET_CODES.setdefault(duration(f"{_b}{_n}:{_sp}"), f"{_b}{_n}:{_sp}")
 
 
 def as_duration(x) -> Fraction:
@@ -80,7 +137,7 @@ def fmt_number(x: Fraction) -> str:
 
 
 def dur_suffix(d: Fraction) -> str:
-    code = DURATION_CODES.get(d)
+    code = DURATION_CODES.get(d) or _TUPLET_CODES.get(d)
     return f".{code}" if code else f"*{fmt_number(d)}"
 
 
@@ -114,6 +171,17 @@ class _Durational:
     q3 = property(lambda self: self._with_dur(DURATIONS["q3"]))
     e3 = property(lambda self: self._with_dur(DURATIONS["e3"]))
     s3 = property(lambda self: self._with_dur(DURATIONS["s3"]))
+
+    def __getattr__(self, name: str):
+        # every other duration code: E4.s5, E4.e7, (C4 & E4).q5
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            d, tup = _duration(name)
+            n = self._with_dur(d)
+            return Note(n.pitches, n.dur, n.tied, n.art, tup)
+        except ValueError:
+            raise AttributeError(f"{type(self).__name__} has no attribute or duration code {name!r}") from None
 
 
 class Pitch(_Durational):
@@ -246,10 +314,13 @@ class Note:
     tied=True ties the note into the next one if it has the same pitches
     (written E4.h.tie in Python, E4.h~ in strings): it sounds as one note.
     art holds articulation suffixes (see ARTICULATIONS): E4.q> is accented.
+    tuplet is the ratio it was written with, (5, 3) for .q5:3, so it prints
+    and engraves that way. It is notation only: two notes of the same length
+    are equal whatever their tuplet.
     """
-    __slots__ = ("pitches", "dur", "tied", "art")
+    __slots__ = ("pitches", "dur", "tied", "art", "tuplet")
 
-    def __init__(self, pitches: Iterable = (), dur=1, tied: bool = False, art: str = ""):
+    def __init__(self, pitches: Iterable = (), dur=1, tied: bool = False, art: str = "", tuplet=None):
         self.pitches: tuple[Pitch, ...] = tuple(sorted({as_pitch(p) for p in pitches}))
         self.dur: Fraction = as_duration(dur)
         self.tied = bool(tied) and bool(self.pitches)
@@ -259,6 +330,7 @@ class Note:
         if not self.pitches and set(art) - {"@"}:
             raise ValueError("a rest can only take a fermata (@)")
         self.art = "".join(c for c in ARTICULATIONS if c in art)
+        self.tuplet = tuple(tuplet) if _tuplet_ok(self.dur, tuplet) else None
 
     @property
     def is_rest(self) -> bool:
@@ -272,14 +344,14 @@ class Note:
 
     @property
     def dot(self) -> "Note":
-        return Note(self.pitches, self.dur * Fraction(3, 2), self.tied, self.art)
+        return Note(self.pitches, self.dur * Fraction(3, 2), self.tied, self.art, self.tuplet)
 
     @property
     def tie(self) -> "Note":
-        return Note(self.pitches, self.dur, True, self.art)
+        return Note(self.pitches, self.dur, True, self.art, self.tuplet)
 
     def articulate(self, art: str) -> "Note":
-        return Note(self.pitches, self.dur, self.tied, self.art + art)
+        return Note(self.pitches, self.dur, self.tied, self.art + art, self.tuplet)
 
     accent = property(lambda self: self.articulate(">"))
     marcato = property(lambda self: self.articulate("^"))
@@ -288,13 +360,15 @@ class Note:
     fermata = property(lambda self: self.articulate("@"))
 
     def with_dur(self, dur) -> "Note":
-        return Note(self.pitches, dur, self.tied, self.art)
+        """Same note, new length; keeps its tuplet if the new length still needs one."""
+        keep = self.tuplet if as_duration(dur) not in WRITTEN else None
+        return Note(self.pitches, dur, self.tied, self.art, keep)
 
     def with_tied(self, tied: bool) -> "Note":
-        return Note(self.pitches, self.dur, tied, self.art)
+        return Note(self.pitches, self.dur, tied, self.art, self.tuplet)
 
     def map_pitches(self, fn: Callable[[Pitch], Pitch]) -> "Note":
-        return Note(tuple(fn(p) for p in self.pitches), self.dur, self.tied, self.art)
+        return Note(tuple(fn(p) for p in self.pitches), self.dur, self.tied, self.art, self.tuplet)
 
     def __add__(self, other) -> "Motif":
         return Motif(self, other)
@@ -311,6 +385,14 @@ class Note:
     def _key(self):
         return self.pitches, self.dur, self.tied, self.art
 
+    def suffix(self) -> str:
+        """The duration part of the token: '.q', '.e5', '.q5:3', '*0.3'."""
+        if self.tuplet:
+            n, space = self.tuplet
+            written = DURATION_CODES[self.dur * Fraction(n, space)]
+            return f".{written}{n}" + (f":{space}" if space != tuplet_space(n) else "")
+        return dur_suffix(self.dur)
+
     def head(self) -> str:
         """The pitch part of the token: 'E4', '[C4 E4 G4]', 'R'."""
         if self.is_rest:
@@ -321,7 +403,7 @@ class Note:
 
     def __repr__(self) -> str:
         """The string-notation token: E4.q, [C4 E4 G4].h, R.e, E4.h~, E4.q>"""
-        return self.head() + dur_suffix(self.dur) + self.art + ("~" if self.tied else "")
+        return self.head() + self.suffix() + self.art + ("~" if self.tied else "")
 
 
 class _Rest(_Durational):
@@ -519,9 +601,13 @@ class Motif:
         return self.map(lambda n: n.map_pitches(fn))
 
     def transpose(self, n: int, scale=None) -> "Motif":
-        """Shift by n semitones, or by n scale steps if a scale/key is given."""
+        """Shift by n semitones, or by n scale steps if a scale/key is given.
+
+        A chromatic transposition is spelled as one interval for the whole
+        motif, whichever needs fewer accidentals: C D E up 6 is F# G# A#
+        (an augmented fourth), not Gb Ab Bb."""
         if scale is None:
-            return self.map_pitches(lambda p: p + n)
+            return self._respelled(lambda p: Pitch(p.midi + n), _letter_shifts(n))
         return self.map_pitches(lambda p: scale.step(p, n))
 
     def octave(self, n: int = 1) -> "Motif":
@@ -541,8 +627,10 @@ class Motif:
                 return self
             around = self.pitches[0]
         axis = as_pitch(around)
-        if scale is None:
-            return self.map_pitches(lambda p: Pitch(2 * axis.midi - p.midi))
+        if scale is None:   # letters mirror around the axis's letter too
+            al = _LETTER_ORDER.index(_spelled(axis)[0]) + 7 * axis.octave
+            return self._respelled(lambda p: Pitch(2 * axis.midi - p.midi),
+                                   [lambda name, p: 2 * al - (_LETTER_ORDER.index(name[0]) + 7 * octave_of(p.midi, name))])
         ai, _ = scale.index(axis)
 
         def flip(p: Pitch) -> Pitch:
@@ -568,6 +656,10 @@ class Motif:
     def diminish(self, factor=2) -> "Motif":
         f = Fraction(factor) if not isinstance(factor, float) else as_duration(factor)
         return self.map(lambda n: n.with_dur(n.dur / f))
+
+    def unbarred(self) -> "Motif":
+        """The same music without its barline anchors (| and |N)."""
+        return Motif(*(it for it in self.items if not isinstance(it, Bar)))
 
     def fragment(self, start: int, stop: int | None = None) -> "Motif":
         """Notes start..stop (Python slice semantics: stop excluded)."""
@@ -603,7 +695,88 @@ class Motif:
         return self.map(lambda n: n if n.is_rest else Note((ps[next(counter) % len(ps)],), n.dur, n.tied))
 
 
+    def _respelled(self, move, shifts) -> "Motif":
+        """Apply `move` to every pitch, spelling the results by the letter
+        shift (from `shifts`) that needs the fewest accidentals overall."""
+        pitches = {id(p): p for p in self.pitches}.values()
+        best = None
+        for shift in shifts:
+            names = {}
+            for p in pitches:
+                name = _spelled(p)
+                k = shift(name, p) if callable(shift) else _LETTER_ORDER.index(name[0]) + shift
+                names[id(p)] = _name_at(move(p).midi, k)
+            if None in names.values():
+                continue
+            cost = sum(n.count("#") + n.count("b") for n in names.values())
+            if best is None or cost < best[0]:
+                best = (cost, names)
+        names = best[1] if best else {}
+        return self.map_pitches(lambda p: Pitch(move(p).midi, names.get(id(p))))
+
+
 M = Motif
+_LETTER_ORDER = "CDEFGAB"
+
+
+def _spelled(p: Pitch) -> str:
+    """A pitch's letter name: as written, or as the current spelling gives it."""
+    return p.spell or pc_name(p.pc)
+
+
+def _name_at(midi: int, letter_index: int) -> str | None:
+    """Spell `midi` with the letter at this index (C=0, D=1 ...), or None if
+    that needs more than a double sharp or flat."""
+    letter = _LETTER_ORDER[letter_index % 7]
+    alter = (midi - LETTERS[letter] + 6) % 12 - 6
+    if abs(alter) > 2:
+        return None
+    return letter + ("#" * alter if alter > 0 else "b" * -alter)
+
+
+def _letter_shifts(semitones: int) -> list[int]:
+    """The letter steps an interval of this many semitones can be spelled
+    with: 7 -> [4] (a fifth); 6 -> [3, 4] (augmented fourth or diminished fifth)."""
+    exact = Fraction(semitones * 7, 12)
+    lo = exact.numerator // exact.denominator
+    return [lo] if exact.denominator == 1 else sorted({lo, lo + 1}, key=lambda k: abs(k - exact))
+
+
+def isorhythm(color, talea, notes: int | None = None) -> Motif:
+    """A repeating rhythm (talea) laid over a repeating pitch series (color),
+    each cycling at its own length, as in a medieval motet or a minimalist
+    phase piece. A rest in the talea passes without using up a pitch.
+
+        isorhythm("C4 D4 F4 G4 A4", [1, 0.5, 0.5, 2])       # 5 pitches over 4 durations
+        isorhythm(theme, M("C4.q R.e C4.e C4.h"), notes=12)
+
+    color: pitches, chords, a string of pitch names, or a Motif (its pitches,
+    chords kept together). talea: numbers of quarter notes, or a Motif or
+    string (its durations, rests and articulations). By default it runs until
+    both cycles end together; notes= sets how many sounding notes to make."""
+    if isinstance(color, str) and not _NOTE.search(color):
+        color = color.split()                                  # bare pitch names
+    if isinstance(color, (str, Motif)):
+        pitches = [n.pitches for n in Motif(color).notes if not n.is_rest]
+    else:
+        pitches = [c.pitches if isinstance(c, (Chord, Note)) else (as_pitch(c),) for c in color]
+    if isinstance(talea, (str, Motif)):
+        steps = [(n.dur, n.is_rest, n.art) for n in Motif(talea).notes]
+    else:
+        steps = [(as_duration(d), False, "") for d in talea]
+    sounding = sum(1 for _, rest, _ in steps if not rest)
+    if not pitches or not sounding:
+        raise ValueError("isorhythm needs at least one pitch and one sounding duration")
+    if notes is None:
+        from math import lcm
+        notes = lcm(len(pitches), sounding)
+    out, k, i = [], 0, 0
+    while k < notes:
+        dur, rest, art = steps[i % len(steps)]
+        out.append(Note((), dur) if rest else Note(pitches[k % len(pitches)], dur, art=art))
+        k += not rest
+        i += 1
+    return Motif(*out)
 
 
 # --- string notation ---------------------------------------------------------
@@ -630,7 +803,7 @@ _TOKEN = re.compile(r'"[^"]*"|\|\d*|\[[^\]]*\][^\s|\[]*|[^\s|\[]+')
 _MARK_TOKENS = {v: k for k, v in Mark.TOKENS.items()}
 _NOTE = re.compile(r"""
     (?P<head> R | \[(?P<chord>[^\]]*)\] | [A-Ga-g][#sb]*-?\d )
-    (?: \.(?P<code>[a-z0-9]+) | \*(?P<num> \d+(?:\.\d+)? | \(\d+/\d+\) | \d+/\d+ ) )
+    (?: \.(?P<code>[a-z0-9:]+) | \*(?P<num> \d+(?:\.\d+)? | \(\d+/\d+\) | \d+/\d+ ) )
     (?P<art>[>^'_@]*)
     (?P<tie>~)?
     """, re.X)
@@ -664,16 +837,18 @@ def _parse_note(tok: str) -> Note:
     m = _NOTE.fullmatch(tok)
     if not m:
         raise NotationError(f"can't read {tok!r}: expected e.g. E4.q, Fs4.e, [C4 E4 G4].h, R.q or E4*1.5")
+    tup = None
     if m["code"] is not None:
-        if m["code"] not in DURATIONS:
-            raise NotationError(f"unknown duration .{m['code']} in {tok!r}; known: {' '.join(DURATIONS)}")
-        dur = DURATIONS[m["code"]]
+        try:
+            dur, tup = _duration(m["code"])
+        except ValueError as e:
+            raise NotationError(f"{e} (in {tok!r})") from None
     else:
         dur = as_duration(Fraction(m["num"].strip("()")))
     if m["head"] == "R":
         if m["tie"]:
             raise NotationError(f"a rest can't be tied: {tok!r}")
-        return Note((), dur, art=m["art"])
+        return Note((), dur, art=m["art"], tuplet=tup)
     if m["chord"] is not None:
         names = m["chord"].split()
         if not names:
@@ -681,4 +856,4 @@ def _parse_note(tok: str) -> Note:
         pitches = [Pitch.parse(n) for n in names]
     else:
         pitches = [Pitch.parse(m["head"])]
-    return Note(pitches, dur, bool(m["tie"]), m["art"])
+    return Note(pitches, dur, bool(m["tie"]), m["art"], tup)
