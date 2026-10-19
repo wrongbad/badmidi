@@ -128,7 +128,7 @@ def _bar_cells(score: Score, part: Part, nbars: int) -> list[list[str]]:
                 last = seg == left
                 # attack articulations on the first piece, a fermata on the last
                 art = "".join(c for c in note.art if (c == "@" and last) or (c != "@" and s == start))
-                tie = not last or note.tied
+                tie = (not last or note.tied) and not note.is_rest
                 head = "R" if note.is_rest else note.head()
                 length = note.suffix() if seg == note.dur else dur_suffix(seg)
                 placed[b].append((s, 1, head + length + art + ("~" if tie else "")))

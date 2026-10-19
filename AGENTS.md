@@ -371,7 +371,8 @@ stages = [build(cell, [0, 4, 8, 2, 6, 10, 1, 5, 9, 3, 7, 11], n).rebar("12/16") 
   Bars with exactly the observations of the bar before are folded into
   `-- bars 12-19: same as 11` by default; `--all` lists every one.
 - **pdf / png / ly**: engraving (see the loop).
-- **midi / wav / all**.
+- **midi / wav / musicxml / all**. `musicxml` is for handing a score to a
+  notation app (MuseScore, Dorico, Sibelius).
 
 In Python these are `score.melody()`, `score.grid()`, `score.form()`,
 `score.check()` and `score.lens()` (keywords `bars=(5, 8)`, `section="B"`,
@@ -429,6 +430,88 @@ calm[0].place(soprano, alto, 17)       # subject at bar 17 in the soprano, the c
 - each result has `.offset`, `.interval`, `.leader`, `.follower`,
   `.observations`, `.summary()`, `.count(kind)` and `.place(a, b, bar, beat)`.
 
+## Working with someone else's music
+
+Often the music isn't yours: a person hands you a MIDI file from their DAW or
+a MusicXML export from their notation app and asks for something ("add a
+harmony part", "make section C more consonant"). There are two ways in.
+
+**Import to a piece** when the Python becomes the working copy:
+
+```
+badmidi import song.mid -o song.py        # also .musicxml / .xml / .mxl
+badmidi song.py check
+```
+
+The result is an ordinary piece file: a docstring with the importer's report,
+`Score(...)`, the parts, and every part's music as bar-anchored strings, four
+bars per `at()` (`--phrase 8` for more). Fill in the bar map in the docstring
+once you know the form, name sections with `score.section()`, and pull ideas
+out into named motifs as you understand them.
+
+**Load at runtime** when the person's file stays the source of truth (they
+keep editing it in their DAW and re-export it), and your work layers on top:
+
+```python
+from badmidi import *
+
+score = load_midi("song.mid", key="D minor")      # or load_musicxml("song.musicxml")
+mel = score["melody"]
+harm = score.part("harmony", "viola")
+harm.at(1, "...")                                 # a new part against theirs
+mel.clear(17, 24).at(17, "...")                   # replace bars 17-24 of their part
+```
+
+`import_midi(path)` / `import_musicxml(path)` return `(score, report)`.
+Every view works on the files directly too: `badmidi song.mid grid --bars 9-16`.
+
+What the importer decides, and reports:
+- **Quantizing** (`--quantize`, `quantize=`): `auto` (default) keeps any time
+  already on a notated grid (32nds, triplets, quintuplets, sextuplets,
+  septuplets) and snaps played timing per beat to sixteenths or eighth
+  triplets. `none` refuses off-grid notes; `s`, `e3`, ... force one grid. The
+  report says how many notes moved and by at most how much. A note too short
+  for the grid is lengthened to one step, never dropped.
+- **Voices**: a track's notes that start and end together are a chord;
+  anything else overlapping goes to another line, `"piano 2"`, on the same
+  staff (as `voice()` would). MusicXML voices and staves are kept as written.
+- **Key**: `key=` if given, else the file's key signature, else an estimate
+  (the report says which). Pitches are spelled by the key unless the file
+  spells them (MusicXML).
+- **Instruments**: by General MIDI program; an instrument badmidi doesn't
+  know gets the nearest sound of its family, with its range widened to the
+  notes it plays. Drum tracks are skipped.
+- **Tempo**: tempo events become `tempo_mark`s; a run of small steps in one
+  direction becomes one `rit`/`accel`. Markers become sections A, B, ...
+- MIDI says nothing of dynamics, articulation, spelling or additive meter
+  groupings; MusicXML does, and they come through.
+
+Hand the result back as `badmidi piece.py musicxml` (for a notation app) or
+`midi` (for a DAW). Say what changed, by bar and part.
+
+`to_source(score)` turns any Score into piece source (it's what `import`
+writes); `Source`, `SourceTrack` and `SourceNote` are the format-neutral
+input `build_score(src)` takes, for feeding music from anywhere else.
+
+### Recipes
+
+**Add a harmony part.** `form` for the shape, `grid` over the melody to see
+what's implied (the chord column is the existing harmony; empty rows are
+yours to decide), write the new part, then
+`lens --parts melody,harmony` to see how the two lines meet, and `grid` again
+for the result.
+
+**Make section C more consonant.** `form` (is C where they think it is? if
+not, ask), `grid --section C` and `lens --section C` to find what makes it
+dissonant (set classes, sevenths and seconds named by how they move). Change
+those notes, in the piece or by `clear()` and re-placing in layered mode,
+then rerun `grid`/`lens` on the same bars and report before and after in
+their terms ("bars 33-34: the free sevenths in the alto now resolve down").
+
+**Revise one part only.** `melody --parts viola --bars 17-24` gives the bars as
+pasteable strings; edit them, place them back at the same bar, and check that
+the other parts are untouched (`melody --parts` the rest, before and after).
+
 ## Things that bite
 
 - **Miscounting a bar** is the usual error, and no tool can prevent it. Put
@@ -458,6 +541,14 @@ calm[0].place(soprano, alto, 17)       # subject at bar 17 in the soprano, the c
   rejected.
 - Bar numbers in a collapsed view still name the real bars: "bars 12-19:
   same as 11" means those bars repeat bar 11's content.
+- **Imported MIDI is a guess at the notation.** Read the report: notes moved
+  by quantizing, an estimated key, a track split into several lines. A
+  played performance without a tempo map comes out in whatever bars the DAW
+  assumed; an upbeat sits in bar 1 after rests. Fix the reading before
+  composing against it.
+- `clear()` rebuilds the part's remaining music without its `|` anchors, so
+  `check` can no longer catch a miscount in what was already there (what you
+  place afterwards is checked as usual).
 
 ## Adding an example
 
@@ -497,7 +588,10 @@ badmidi/score.py     Score, Part (incl. drift), Meter, the instrument table, tim
 badmidi/views.py     melody, grid, form, check, lens; chord naming
 badmidi/analysis.py  observe() (the lens), pitch-class sets, stretti()
 badmidi/perform.py   markings -> playback: dynamics, hairpins, accents, tempo map, pedal, per-part drift clock
-badmidi/midi.py      Standard MIDI File writer and reader
+badmidi/midi.py      Standard MIDI File writer and reader (read_midi -> Source)
+badmidi/ingest.py    Source/SourceTrack/SourceNote, build_score: quantize, voices, key, instruments; load_midi
+badmidi/musicxml.py  MusicXML writer and reader (load_musicxml)
+badmidi/source.py    to_source: any Score -> piece source (what `badmidi import` writes)
 badmidi/lilypond.py  LilyPond export, rendering, and verification against LilyPond's MIDI
 badmidi/loops.py     which Part.loop() spans can be engraved as repeats
 badmidi/render.py    wav through fluidsynth

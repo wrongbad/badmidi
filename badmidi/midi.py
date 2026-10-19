@@ -105,64 +105,174 @@ def write_midi(score: Score, path: str) -> None:
 # --- reading -------------------------------------------------------------------
 
 
-def read_notes(data: bytes) -> list[tuple[Fraction, int, Fraction]]:
-    """(onset, pitch, duration) for every note in a Standard MIDI File, times in
-    quarter notes. Used to prove an engraving contains exactly the score's notes."""
+def _vlq_at(data: bytes, pos: int) -> tuple[int, int]:
+    n = 0
+    while True:
+        b = data[pos]
+        pos += 1
+        n = (n << 7) | (b & 0x7F)
+        if b < 0x80:
+            return n, pos
+
+
+def _read_events(data: bytes):
+    """Parse a Standard MIDI File into (format, ticks per quarter, tracks); each
+    track is a list of (tick, status, payload) in file order. A channel message
+    has its status byte and the data bytes; a meta event has status 0xFF and
+    (type, bytes); sysex is status 0xF0 with its bytes. Running status works."""
     if data[:4] != b"MThd":
         raise ValueError("not a MIDI file")
+    fmt = int.from_bytes(data[8:10], "big")
     ntracks = int.from_bytes(data[10:12], "big")
     ppq = int.from_bytes(data[12:14], "big")
-    pos, notes = 14, []
+    if ppq & 0x8000:
+        raise ValueError("MIDI files timed in SMPTE frames are not supported")
+    pos, tracks = 14, []
     for _ in range(ntracks):
         if data[pos:pos + 4] != b"MTrk":
             raise ValueError("bad track header")
         end = pos + 8 + int.from_bytes(data[pos + 4:pos + 8], "big")
         pos += 8
-        tick, status, sounding = 0, 0, {}
+        tick, status, events = 0, 0, []
         while pos < end:
-            delta = 0
-            while True:
-                b = data[pos]
-                pos += 1
-                delta = (delta << 7) | (b & 0x7F)
-                if b < 0x80:
-                    break
+            delta, pos = _vlq_at(data, pos)
             tick += delta
             if data[pos] >= 0x80:
                 status = data[pos]
                 pos += 1
-            kind = status & 0xF0
-            if status == 0xFF:                      # meta: type, length, data
-                pos += 1
-                length = 0
-                while True:
-                    b = data[pos]
-                    pos += 1
-                    length = (length << 7) | (b & 0x7F)
-                    if b < 0x80:
-                        break
+            if status == 0xFF:
+                kind = data[pos]
+                length, pos = _vlq_at(data, pos + 1)
+                events.append((tick, 0xFF, (kind, data[pos:pos + length])))
                 pos += length
-            elif status in (0xF0, 0xF7):            # sysex
-                length = 0
-                while True:
-                    b = data[pos]
-                    pos += 1
-                    length = (length << 7) | (b & 0x7F)
-                    if b < 0x80:
-                        break
+            elif status in (0xF0, 0xF7):
+                length, pos = _vlq_at(data, pos)
+                events.append((tick, 0xF0, data[pos:pos + length]))
                 pos += length
-            elif kind in (0x80, 0x90):
-                pitch, vel = data[pos], data[pos + 1]
-                pos += 2
-                k = (status & 0x0F, pitch)
-                if kind == 0x90 and vel > 0:
-                    sounding.setdefault(k, []).append(tick)
-                elif sounding.get(k):
-                    on = sounding[k].pop(0)
-                    notes.append((Fraction(on, ppq), pitch, Fraction(tick - on, ppq)))
-            elif kind in (0xC0, 0xD0):
-                pos += 1
-            else:                                   # 0xA0, 0xB0, 0xE0
-                pos += 2
+            else:
+                n = 1 if status & 0xF0 in (0xC0, 0xD0) else 2
+                events.append((tick, status, tuple(data[pos:pos + n])))
+                pos += n
+        tracks.append(events)
         pos = end
+    return fmt, ppq, tracks
+
+
+def read_notes(data: bytes) -> list[tuple[Fraction, int, Fraction]]:
+    """(onset, pitch, duration) for every note in a Standard MIDI File, times in
+    quarter notes. Used to prove an engraving contains exactly the score's notes."""
+    _, ppq, tracks = _read_events(data)
+    notes = []
+    for events in tracks:
+        sounding = {}
+        for tick, status, p in events:
+            kind = status & 0xF0
+            if status >= 0xF0 or kind not in (0x80, 0x90):
+                continue
+            k = (status & 0x0F, p[0])
+            if kind == 0x90 and p[1] > 0:
+                sounding.setdefault(k, []).append(tick)
+            elif sounding.get(k):
+                on = sounding[k].pop(0)
+                notes.append((Fraction(on, ppq), p[0], Fraction(tick - on, ppq)))
     return sorted(notes)
+
+
+_MAJOR_TONICS = ["Cb", "Gb", "Db", "Ab", "Eb", "Bb", "F", "C", "G", "D", "A", "E", "B", "F#", "C#"]
+_MINOR_TONICS = ["Ab", "Eb", "Bb", "F", "C", "G", "D", "A", "E", "B", "F#", "C#", "G#", "D#", "A#"]
+
+
+def _text(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return raw.decode("latin-1").strip()
+
+
+def read_midi(data: bytes, title: str = ""):
+    """A Standard MIDI File as an ingest.Source, ready for build_score.
+
+    One SourceTrack per (track, channel) that has notes (so a format 0 file, or
+    a track mixing channels, splits by channel); program changes, sustain
+    pedal (CC 64, as PED / PED_UP marks) and note velocities come along. Tempo,
+    time signature, key signature and markers (meta 0x06, 0x07, and text 0x01
+    in tracks without notes) go to the Source. `title` is used when the file
+    names none (the name of a note-less first track, or of a format 0 file)."""
+    from .core import PED, PED_UP
+    from .ingest import Source, SourceNote, SourceTrack
+    from .scale import key as parse_key
+
+    fmt, ppq, tracks = _read_events(data)
+
+    def T(tick: int) -> Fraction:
+        return Fraction(tick, ppq)
+
+    src = Source(title=title)
+    tempos, meters, markers = {}, {}, []
+    for ti, events in enumerate(tracks):
+        name, text_events = "", []
+        chans: dict[int, dict] = {}
+
+        def chan(c: int) -> dict:
+            return chans.setdefault(c, dict(notes=[], on={}, program=None, seen=None, marks=[], pedal=False))
+        for tick, status, p in events:
+            if status == 0xFF:
+                kind, raw = p
+                if kind == 0x03 and not name:
+                    name = _text(raw)
+                elif kind in (0x06, 0x07) and _text(raw):
+                    markers.append((T(tick), _text(raw)))
+                elif kind == 0x01 and _text(raw):
+                    text_events.append((T(tick), _text(raw)))
+                elif kind == 0x51 and len(raw) == 3:
+                    tempos[T(tick)] = round(60_000_000 / int.from_bytes(raw, "big"), 3)
+                elif kind == 0x58 and len(raw) >= 2:
+                    meters[T(tick)] = (raw[0], 1 << raw[1])
+                elif kind == 0x59 and len(raw) == 2 and src.key is None:
+                    sf = raw[0] - 256 if raw[0] > 127 else raw[0]
+                    if -7 <= sf <= 7:
+                        tonics = _MINOR_TONICS if raw[1] else _MAJOR_TONICS
+                        src.key = parse_key(f"{tonics[sf + 7]} {'minor' if raw[1] else 'major'}")
+                continue
+            if status >= 0xF0:
+                continue
+            kind, c = status & 0xF0, status & 0x0F
+            if kind == 0xC0:
+                chan(c)["seen"] = p[0]
+            elif kind == 0xB0 and p[0] == 64:
+                st = chan(c)
+                if (p[1] >= 64) != st["pedal"]:
+                    st["pedal"] = p[1] >= 64
+                    st["marks"].append((T(tick), PED if st["pedal"] else PED_UP))
+            elif kind in (0x80, 0x90):
+                st = chan(c)
+                if kind == 0x90 and p[1] > 0:
+                    if st["program"] is None:
+                        st["program"] = st["seen"] if st["seen"] is not None else -1
+                    st["on"].setdefault(p[0], []).append((tick, p[1]))
+                elif st["on"].get(p[0]):
+                    on, vel = st["on"][p[0]].pop(0)
+                    if tick > on:
+                        st["notes"].append(SourceNote(T(on), T(tick - on), p[0], vel))
+        last = events[-1][0] if events else 0
+        for st in chans.values():                       # notes never released end with the track
+            for pitch, ons in st["on"].items():
+                st["notes"] += [SourceNote(T(on), T(last - on), pitch, vel) for on, vel in ons if last > on]
+        playing = sorted(c for c, st in chans.items() if st["notes"])
+        if not playing:
+            if ti == 0 and fmt == 1 and name and not src.title:
+                src.title = name
+            markers += text_events
+            continue
+        if fmt == 0 and name and not src.title:
+            src.title = name
+        for c in playing:
+            st = chans[c]
+            label = name if len(playing) == 1 else (f"{name} {c + 1}" if name and fmt == 1 else f"channel {c + 1}")
+            st["notes"].sort(key=lambda n: (n.onset, n.midi))
+            src.tracks.append(SourceTrack(label, None if st["program"] in (None, -1) else st["program"],
+                                          st["notes"], st["marks"], channel=c))
+    src.tempos = sorted(tempos.items())
+    src.meters = sorted((t, n, d) for t, (n, d) in meters.items())
+    src.markers = sorted(dict.fromkeys(markers), key=lambda m: m[0])
+    return src

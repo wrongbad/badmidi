@@ -197,6 +197,53 @@ class Part:
         self.score.loops.append(Loop(self, t, body.dur, times))
         return self._place(t, [body] * times)
 
+    def clear(self, first_bar: int, last_bar: int | None = None) -> "Part":
+        """Remove this part's notes and markings from the start of first_bar
+        to the end of last_bar (default: just first_bar), so a passage of an
+        imported or generated part can be replaced:
+
+            vla.clear(17, 24).at(17, new_passage)
+
+        A note that starts earlier is shortened to end where the span starts
+        (its tie dropped); one that sounds on past the span keeps the part
+        that falls after it, so the music outside is unchanged. Loops of this
+        part that overlap the span are forgotten (they're no longer true).
+        Barline anchors in the part's earlier placements are not kept."""
+        last_bar = first_bar if last_bar is None else last_bar
+        if last_bar < first_bar:
+            raise ValueError(f"clear() needs last_bar >= first_bar (got {first_bar}-{last_bar})")
+        a, b = self.score.bar_start(first_bar), self.score.bar_start(last_bar + 1)
+        items: list[tuple[Fraction, int, Note | Mark]] = []   # marks sort before notes at the same time
+        for t, mk in self.marks(Mark):
+            if not a <= t < b:
+                items.append((t, 0, mk))
+        for t, n in self.events(merge_ties=False):
+            end = t + n.dur
+            if end <= a or t >= b:
+                items.append((t, 1, n.with_tied(False) if end == a and n.tied else n))
+                continue
+            if t < a:
+                items.append((t, 1, Note(n.pitches, a - t, False, n.art.replace("@", ""))))
+            if end > b:
+                tail = n.with_dur(end - b)
+                items.append((b, 1, Note(tail.pitches, tail.dur, n.tied, "@" if "@" in n.art else "", tail.tuplet)))
+        items.sort(key=lambda x: (x[0], x[1]))
+        runs: list[tuple[Fraction, list]] = []
+        end = None
+        for t, _, it in items:
+            if end is None or t != end:
+                runs.append((t, []))
+                end = t
+            runs[-1][1].append(it)
+            if isinstance(it, Note):
+                end += it.dur
+        self.placements = [(t, Motif(*its)) for t, its in runs]
+        old = self._last_end
+        self._last_end = a if a < old <= b else old
+        self.score.loops = [lp for lp in self.score.loops
+                            if lp.part is not self or lp.end <= a or lp.start >= b]
+        return self
+
     def _place(self, t: Fraction, material) -> "Part":
         # one placement per argument: check() treats a motif that enters
         # mid-bar on its own terms (see views._enters_mid_bar)

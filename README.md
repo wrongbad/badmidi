@@ -75,6 +75,9 @@ seriously, and so can a person who likes to think in code.
   layouts, registrations, tuplet brackets), Standard MIDI, and audio through
   FluidSynth. Playback is a separate layer that turns markings into velocity
   curves, tempo maps and pedalling without touching the printed score.
+- **Collaboration**: import MIDI or MusicXML (quantized, voiced, spelled,
+  with a report of every guess) as an editable piece or load it live and
+  layer on top; export MusicXML back to a notation app.
 
 Pure-stdlib Python. LilyPond for sheet music, FluidSynth and a General MIDI
 soundfont for audio.
