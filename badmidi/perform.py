@@ -78,6 +78,29 @@ def seconds_at(tmap, t: Fraction) -> float:
     return secs
 
 
+# --- per-part drift ----------------------------------------------------------
+
+
+def warp(part):
+    """The part's playback clock: a function from written time to the time it
+    sounds at (both in quarter notes, before the score's tempo map). Each
+    drift adds a linear ramp of `ahead` over its span and holds it after.
+    Raises ValueError if the part would have to play backwards."""
+    drifts = list(part.drifts)
+    if not drifts:
+        return lambda t: t
+    cuts = sorted({d.start for d in drifts} | {d.end for d in drifts})
+
+    def offset(t):
+        return sum((d.ahead * (min(max(t, d.start), d.end) - d.start) / (d.end - d.start) for d in drifts),
+                   Fraction(0))
+    for a, b in zip(cuts, cuts[1:]):
+        if (b - a) + offset(b) - offset(a) <= 0:
+            raise ValueError(f"drift on {part.name!r} would play backwards between "
+                             f"{part.score.where(a)} and {part.score.where(b)}; use a smaller `ahead` or a longer span")
+    return lambda t: max(Fraction(0), t + offset(t))
+
+
 # --- dynamics ----------------------------------------------------------------
 
 

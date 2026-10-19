@@ -14,7 +14,8 @@ import shutil
 import subprocess
 from fractions import Fraction
 
-from .core import Mark, Note, fmt_number, octave_of, pc_name, spelling, tuplet_space
+from .core import Mark, Note, derived_tuplet, fmt_number, octave_of, pc_name, spelling, tuplet_space
+from .loops import Plan, plan_loops
 from .midi import read_notes
 from .score import Part, Score
 
@@ -53,11 +54,9 @@ def _tuplet(d: Fraction) -> tuple[int, int] | None:
     return None if q == 1 else (q, tuplet_space(q))
 
 
-def _split(d: Fraction, written_as=None) -> list[tuple[Fraction, str, tuple[int, int] | None]]:
-    """Break a length into printable values: (length, lily duration, tuplet).
-    Inside a tuplet the written values are the sounding ones scaled by n/space.
-    written_as is the note's own ratio (5, 3), used when it fits the length."""
-    tup = written_as if written_as and d * Fraction(*written_as) in NORMAL else _tuplet(d)
+def _pieces(d: Fraction, tup: tuple[int, int] | None):
+    """d broken into printable values under one tuplet ratio, or None if it
+    can't be written (a ratio-free fallback is handled by the caller)."""
     scale = Fraction(tup[0], tup[1]) if tup else Fraction(1)
     written, out = d * scale, []
     while written > 0:
@@ -66,10 +65,27 @@ def _split(d: Fraction, written_as=None) -> list[tuple[Fraction, str, tuple[int,
                 out.append((v / scale, s, tup))
                 written -= v
                 break
-        else:  # not expressible with plain or dotted values: scale the duration
-            out.append((written / scale, f"4*{d.numerator}/{d.denominator}", None))
-            break
+        else:
+            return None
     return out
+
+
+def _split(d: Fraction, written_as=None) -> list[tuple[Fraction, str, tuple[int, int] | None]]:
+    """Break a length into printable values: (length, lily duration, tuplet).
+    Inside a tuplet the written values are the sounding ones scaled by n/space.
+    The ratio is the note's own (written_as, 5:3 for .q5:3) when it fits the
+    length; otherwise whichever of the odd-denominator ratio (3:2, 5:4) and the
+    ratio the length is spelled with (12:11 for 11/48) needs fewer tied pieces."""
+    candidates = []
+    if written_as and d * Fraction(*written_as) in NORMAL:
+        candidates.append(tuple(written_as))
+    candidates += [_tuplet(d), derived_tuplet(d)]
+    best = None
+    for tup in candidates:
+        pieces = _pieces(d, tup)
+        if pieces is not None and (best is None or len(pieces) < len(best)):
+            best = pieces
+    return best or [(d, f"4*{d.numerator}/{d.denominator}", None)]
 
 
 def _clef(parts: list[Part]) -> str:
@@ -105,7 +121,8 @@ def _ottavas(score: Score, part: Part, nbars: int, clef: str) -> list[int]:
     return [rule(min(r), max(r)) if r else 0 for r in ranges]
 
 
-def _voice(score: Score, part: Part, nbars: int, primary: bool, clef: str | None = None) -> str:
+def _voice(score: Score, part: Part, nbars: int, primary: bool, clef: str | None = None,
+           plan: Plan | None = None) -> str:
     """One voice as LilyPond music, with a bar check after every bar.
     Gaps print as rests in a staff's first voice and as invisible spacers in
     the others. With a clef, bars far off the staff get an ottava sign."""
@@ -152,19 +169,17 @@ def _voice(score: Score, part: Part, nbars: int, primary: bool, clef: str | None
             left -= seg
 
     shifts = _ottavas(score, part, nbars, clef) if clef else [0] * nbars
-    out, shift = [], 0
-    for b, bar in enumerate(bars):
+    rests = []
+    for bar in bars:
         words, run = [], []
-        if shifts[b] != shift:
-            shift = shifts[b]
-            words.append(f"\\ottava #{shift}")
         held, kind = Fraction(0), None
+        first_len = None
 
         def close():
-            nonlocal run, held
+            nonlocal run, held, first_len
             if run:
                 words.append(f"\\tuplet {kind[0]}/{kind[1]} {{ " + " ".join(run) + " }")
-            run, held = [], Fraction(0)
+            run, held, first_len = [], Fraction(0), None
         for tok, tup in bar + [("", None)]:
             if tup and tup[0] == kind:
                 run.append(tok)
@@ -177,12 +192,36 @@ def _voice(score: Score, part: Part, nbars: int, primary: bool, clef: str | None
                 if tok:
                     words.append(tok)
                 continue
-            # one bracket per beat's worth, not one across a whole run
+            # one bracket per beat's worth (or per n equal notes), not one across a whole run
+            written = tup[1] * Fraction(kind[0], kind[1])
+            first_len = written if first_len is None else first_len
             held += tup[1]
-            if held.denominator == 1:
+            if held.denominator == 1 or (written_total(held, kind) == first_len * kind[0]
+                                         and written_total(held, kind) in NORMAL):
                 close()
-        out.append(" ".join(words) + " |")
-    return "\n    ".join(out)
+        rests.append(" ".join(words))
+
+    # Assemble bar by bar, carrying the ottava state. A repeated stretch must
+    # hand the next pass the state it started with.
+    pieces, state = [], 0
+    for t0, t1, sp in (plan.segments(total) if plan else [(Fraction(0), total, None)]):
+        b0, b1 = score.position(t0)[0] - 1, score.position(t1)[0] - 1
+        chunk = []
+        for b in range(b0, b1):
+            word = f"\\ottava #{shifts[b]} " if shifts[b] != state else ""
+            state = shifts[b]
+            chunk.append(word + rests[b] + " |")
+        if sp is not None:
+            if shifts[b1 - 1] != shifts[b0]:
+                chunk[-1] = chunk[-1][:-1] + f"\\ottava #{shifts[b0]} |"
+                state = shifts[b0]
+            chunk = [f"\\repeat volta {sp.times} {{"] + ["  " + c for c in chunk] + ["}"]
+        pieces.extend(chunk)
+    return "\n    ".join(pieces)
+
+
+def written_total(held: Fraction, kind: tuple[int, int]) -> Fraction:
+    return held * Fraction(kind[0], kind[1])
 
 
 # --- marking lines -------------------------------------------------------------
@@ -193,19 +232,37 @@ def _spacers(segments: list[tuple[Fraction, Fraction, str]]) -> str:
     return " ".join(f"s{_whole(d)}{att}" for _, d, att in segments if d > 0)
 
 
-def _mark_line(times_marks: list[tuple[Fraction, str]], total: Fraction) -> str:
+def _mark_line(times_marks: list[tuple[Fraction, str]], total: Fraction, clamp: bool = True) -> str:
     """Spacer music carrying attachments at the given times. Attachments at
     the very end go on a short final spacer."""
     tail = Fraction(1, 8)
     at: dict[Fraction, str] = {}
     for t, ly in times_marks:
-        t = min(t, total - tail)
+        t = min(t, total - tail) if clamp else t
         at[t] = at.get(t, "") + ly
     cuts = sorted(set(at) | {Fraction(0), total})
     return _spacers([(a, b - a, at.get(a, "")) for a, b in zip(cuts, cuts[1:])])
 
 
-def _dynamics_line(parts: list[Part], total: Fraction, defs: list[str]) -> str | None:
+def _cut(plan: Plan, items: list[tuple[Fraction, str]], total: Fraction, render, extra=()) -> str:
+    """A line of spacer music for the whole score, built stretch by stretch
+    so that a repeated stretch is written once: render(items, length, final)
+    makes the music of one stretch from its (time within it, attachment)
+    items. A line's items at the very end belong to the last stretch."""
+    segs = plan.segments(total)
+    out = []
+    for i, (t0, t1, sp) in enumerate(segs):
+        final = i == len(segs) - 1
+        sel = [(t - t0, ly) for t, ly in items if t0 <= t < t1 or (final and t >= total)]
+        sel += [(t - t0, ly) for t, ly in extra if t0 <= t < t1]
+        if sp is not None:
+            sel = [(min(t, t1 - t0), ly) for t, ly in sel]
+        music = render(sel, t1 - t0, final)
+        out.append(f"\\repeat volta {sp.times} {{ {music} }}" if sp else music)
+    return " ".join(out)
+
+
+def _dynamics_line(parts: list[Part], total: Fraction, defs: list[str], plan: Plan) -> str | None:
     seen, items = set(), []
     for p in parts:
         for t, m in p.marks(Mark):
@@ -235,7 +292,7 @@ def _dynamics_line(parts: list[Part], total: Fraction, defs: list[str]) -> str |
                 out.append((t, f'-\\markup {{ \\italic "{_esc(m.value)}" }}'))
             else:
                 out.append((t, ly[m.kind]))
-    return _mark_line(out, total)
+    return _cut(plan, out, total, _mark_line)
 
 
 def _esc(text: str) -> str:
@@ -252,7 +309,7 @@ def _letters(n: int) -> str:
             return out
 
 
-def _pedal_line(parts: list[Part], total: Fraction) -> str | None:
+def _pedal_line(parts: list[Part], total: Fraction, plan: Plan) -> str | None:
     seen, items = set(), []
     for p in parts:
         for t, m in p.marks(Mark):
@@ -271,10 +328,38 @@ def _pedal_line(parts: list[Part], total: Fraction) -> str | None:
             down = False
     if down:
         out.append((total, "\\sustainOff"))
-    return _mark_line(out, total)
+    return _cut(plan, out, total, _mark_line)
 
 
-def _tempo_line(score: Score, total: Fraction) -> str:
+def _render_around(items, length, final):
+    """Spacer music for one stretch where \\tempo, \\mark and \\override come
+    before a spacer and \\startTextSpan and markup after it."""
+    tail = Fraction(1, 8)
+    before: dict[Fraction, str] = {}
+    after: dict[Fraction, str] = {}
+    for t, ly in items:
+        t = min(t, length - tail) if t >= length else t
+        d = after if ly.startswith(("\\st", "^")) else before
+        d[t] = d.get(t, "") + ly
+    cuts = sorted(set(before) | set(after) | {Fraction(0), length})
+    return " ".join(f"{before.get(a, '')}s{_whole(b - a)}{after.get(a, '')}" for a, b in zip(cuts, cuts[1:]))
+
+
+def _drift_line(members: list[Part], total: Fraction, plan: Plan) -> str | None:
+    """A dashed text spanner over each drift of the staff's parts."""
+    items = []
+    for p in members:
+        for d in p.drifts:
+            items.append((d.start, "\\once \\override TextSpanner.bound-details.left.text = "
+                                   f'\\markup {{ \\italic "{_esc(d.text)}" }} '))
+            items.append((d.start, "\\startTextSpan"))
+            items.append((d.end, "\\stopTextSpan"))
+    return _cut(plan, items, total, _render_around) if items else None
+
+
+def _tempo_line(score: Score, total: Fraction, plan: Plan) -> str:
+    """The top staff's spacer line: tempo marks, rit. spans, rehearsal marks
+    (sections), and the x8 over each repeat with the bar number that follows it."""
     items = []
     for m in score.tempo_marks:
         if m.gradual:
@@ -286,60 +371,68 @@ def _tempo_line(score: Score, total: Fraction) -> str:
             txt = f'"{m.text}" ' if m.text else ""
             bpm = f"4 = {round(m.bpm)}" if m.bpm else ""
             items.append((m.start, f"\\tempo {txt}{bpm} "))
-    # \tempo and \override come before the spacer, \startTextSpan after it
-    tail = Fraction(1, 8)
-    before: dict[Fraction, str] = {}
-    after: dict[Fraction, str] = {}
-    for t, ly in items:
-        t = min(t, total - tail) if t >= total else t
-        (after if ly.startswith("\\st") else before)[t] = (after if ly.startswith("\\st") else before).get(t, "") + ly
-    cuts = sorted(set(before) | set(after) | {Fraction(0), total})
-    return " ".join(f"{before.get(a, '')}s{_whole(b - a)}{after.get(a, '')}" for a, b in zip(cuts, cuts[1:]))
+    for sec in score.sections:
+        t = score.bar_start(sec.bar)
+        items.append((t, f'\\mark \\markup {{ \\box "{_esc(sec.label)}" }} '))
+        if sec.description:
+            items.append((t, f'^\\markup {{ \\small \\italic "{_esc(sec.description)}" }}'))
+    for sp in plan.spans:
+        items.append((sp.start, f'^\\markup {{ \\bold "\u00d7{sp.times}" }}'))
+        if sp.end < total:
+            items.append((sp.end, f"\\set Score.currentBarNumber = #{sp.after} "))
+    return _cut(plan, items, total, _render_around)
 
 
 # --- the whole score -----------------------------------------------------------
 
 
-def _global_time(score: Score, nbars: int) -> str:
+def _global_time(score: Score, nbars: int, plan: Plan) -> str:
     """Time signatures and the bars' lengths as spacers. A free bar is an
-    irregular measure with no time signature, breakable at every beat."""
+    irregular measure with no time signature, breakable at every beat.
+    A repeated stretch is written once."""
     starts = score.barlines(nbars)
-    out: list[str] = []
-    prev, run = None, Fraction(0)          # run: length of metered bars not yet written
-    for b in range(1, nbars + 1):
-        m = score.meter_at(b)
-        if m.free is None and m == prev:
-            run += starts[b] - starts[b - 1]
-            continue
+    pieces: list[str] = []
+    prev = None
+    for t0, t1, sp in plan.segments(starts[-1]):
+        out: list[str] = []
+        run = Fraction(0)          # length of metered bars not yet written
+        for b in range(score.position(t0)[0], score.position(t1)[0]):
+            m = score.meter_at(b)
+            if m.free is None and m == prev:
+                run += starts[b] - starts[b - 1]
+                continue
+            if run:
+                out.append(f"s{_whole(run)}")
+                run = Fraction(0)
+            if m.free is None:
+                if m.explicit:     # printed as 2+2+3 over 8, beamed in those groups
+                    out.append(f"\\compoundMeter #'(({' '.join(map(str, m.groups))} {m.den}))")
+                else:
+                    out.append(f"\\time {m.num}/{m.den}")
+                run = starts[b] - starts[b - 1]
+            else:
+                if b == 1:
+                    out.append("\\once \\omit Staff.TimeSignature")
+                w = m.free / 4
+                out.append(f"\\set Timing.measureLength = #(ly:make-moment {w.numerator}/{w.denominator})")
+                beats, rest = int(m.free), m.free - int(m.free)
+                out.append(" \\bar \"\" ".join(["s4"] * beats + ([f"s{_whole(rest)}"] if rest else [])))
+            prev = m
         if run:
             out.append(f"s{_whole(run)}")
-            run = Fraction(0)
-        if m.free is None:
-            if m.explicit:     # printed as 2+2+3 over 8, beamed in those groups
-                out.append(f"\\compoundMeter #'(({' '.join(map(str, m.groups))} {m.den}))")
-            else:
-                out.append(f"\\time {m.num}/{m.den}")
-            run = starts[b] - starts[b - 1]
-        else:
-            if b == 1:
-                out.append("\\once \\omit Staff.TimeSignature")
-            w = m.free / 4
-            out.append(f"\\set Timing.measureLength = #(ly:make-moment {w.numerator}/{w.denominator})")
-            beats, rest = int(m.free), m.free - int(m.free)
-            out.append(" \\bar \"\" ".join(["s4"] * beats + ([f"s{_whole(rest)}"] if rest else [])))
-        prev = m
-    if run:
-        out.append(f"s{_whole(run)}")
-    return " ".join(out)
+        text = " ".join(out)
+        pieces.append(f"\\repeat volta {sp.times} {{ {text} }}" if sp else text)
+    return " ".join(pieces)
 
 
 def lilypond(score: Score) -> str:
     nbars = score.bars
     total = score.barlines(nbars)[-1]
     k = score.key
+    plan = plan_loops(score)
     with spelling(k):
         tonic = _pitch_name_only(k.tonic_name)
-        glob = f"\\key {tonic} \\{MODES[k.mode]} {_global_time(score, nbars)} \\bar \"|.\""
+        glob = f"\\key {tonic} \\{MODES[k.mode]} {_global_time(score, nbars, plan)} \\bar \"|.\""
 
         # staves in score order; each staff = parts sharing .staff
         staves: list[tuple[str, list[Part]]] = []
@@ -357,7 +450,7 @@ def lilypond(score: Score) -> str:
             label = f'\\with {{ instrumentName = "{title}" }} ' if not (m0.group and m0.brace) else ""
             lines = [f'\\new Staff = "{name}" {label}<<', "  \\global", f"  \\clef {_clef(members)}"]
             if top:
-                lines.append("  { " + _tempo_line(score, total) + " }")
+                lines.append("  { " + _tempo_line(score, total, plan) + " }")
             texts: dict[Fraction, list[str]] = {}
             for m in members:                       # one label per moment, duplicates merged
                 for t, text, _ in m.registrations:
@@ -366,14 +459,17 @@ def lilypond(score: Score) -> str:
             regs = [(t, f'^\\markup {{ \\small \\italic "{_esc(" / ".join(ts))}" }}')
                     for t, ts in sorted(texts.items())]
             if regs:
-                lines.append("  { " + _mark_line(regs, total) + " }")
+                lines.append("  { " + _cut(plan, regs, total, _mark_line) + " }")
+            drift = _drift_line(members, total, plan)
+            if drift:
+                lines.append("  { " + drift + " }")
             if len(members) == 1:   # ottava signs only where one voice owns the staff
-                lines.append("  {\n    " + _voice(score, members[0], nbars, True, _clef(members)) + "\n  }")
+                lines.append("  {\n    " + _voice(score, members[0], nbars, True, _clef(members), plan) + "\n  }")
             else:
                 for i, m in enumerate(members):
                     vo = ["\\voiceOne", "\\voiceTwo", "\\voiceThree", "\\voiceFour"][min(i, 3)]
                     lines.append(f'  \\new Voice = "{m.name}" {{ {vo}\n    '
-                                 + _voice(score, m, nbars, i == 0) + "\n  }")
+                                 + _voice(score, m, nbars, i == 0, None, plan) + "\n  }")
             lines.append(">>")
             return "\n".join(lines)
 
@@ -384,8 +480,8 @@ def lilypond(score: Score) -> str:
             group = members[0].group
             if group is None:
                 body.append(staff_ly(name, members, i == 0))
-                dyn = _dynamics_line(members, total, defs)
-                ped = _pedal_line(members, total)
+                dyn = _dynamics_line(members, total, defs, plan)
+                ped = _pedal_line(members, total, plan)
                 for line in (dyn, ped):
                     if line:
                         body.append("\\new Dynamics { " + line + " }")
@@ -401,10 +497,10 @@ def lilypond(score: Score) -> str:
             for j, (n, ms) in enumerate(braced):
                 inner.append(staff_ly(n, ms, i == 0 and j == 0))
                 if j == 0:
-                    dyn = _dynamics_line(gparts, total, defs)
+                    dyn = _dynamics_line(gparts, total, defs, plan)
                     if dyn:
                         inner.append("\\new Dynamics { " + dyn + " }")
-            ped = _pedal_line(gparts, total)
+            ped = _pedal_line(gparts, total, plan)
             if ped:
                 inner.append("\\new Dynamics \\with { pedalSustainStyle = #'mixed } { " + ped + " }")
             body.append(f'\\new PianoStaff \\with {{ instrumentName = "{group}" }} <<\n'
@@ -415,20 +511,20 @@ def lilypond(score: Score) -> str:
     if score.composer:
         header.append(f'  composer = "{score.composer}"')
     header.append("  tagline = ##f")
+    layout = "  \\layout { }\n  \\midi { }\n"
+    if plan.spans:     # play the repeats out for the MIDI the engraving is verified against
+        score_blocks = ["music = <<", _indent(_indent("\n".join(body))), ">>",
+                        "\\score {", "  \\music", "  \\layout { }", "}",
+                        "\\score {", "  \\unfoldRepeats \\music", "  \\midi { }", "}", ""]
+    else:
+        score_blocks = ["\\score {", "  <<", _indent(_indent("\n".join(body))), "  >>", layout.rstrip("\n"), "}", ""]
     return "\n".join([
         '\\version "2.24.0"',
         '\\language "english"',
         "\\header {", *header, "}",
         *defs,
         "global = { " + glob + " }",
-        "\\score {",
-        "  <<",
-        _indent(_indent("\n".join(body))),
-        "  >>",
-        "  \\layout { }",
-        "  \\midi { }",
-        "}",
-        "",
+        *score_blocks,
     ])
 
 
@@ -490,7 +586,7 @@ def engrave(score: Score, path: str, fmt: str = "pdf", strict: bool = True, keep
     if not exe:
         raise FileNotFoundError("lilypond not found (brew install lilypond)")
     stem = os.path.splitext(path)[0]
-    with open(stem + ".ly", "w") as f:
+    with open(stem + ".ly", "w", encoding="utf-8") as f:
         f.write(lilypond(score))
     args = [exe, "-s", "-o", stem]
     args += ["--png", "-dresolution=110"] if fmt == "png" else ["--pdf"]

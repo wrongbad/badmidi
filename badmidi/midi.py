@@ -70,22 +70,23 @@ def midi_bytes(score: Score) -> bytes:
     for part in score.parts:
         ch = channel_of[part.channel]
         first_in_channel = next(p for p in score.parts if p.channel == part.channel) is part
+        at = perform.warp(part)           # this part's playback clock (drift)
         evs = [(0, 0, _meta(0x03, part.name.encode()))]
         if first_in_channel:
             i = keys.index(part.channel)
             pan = part.pan if part.pan is not None else (64 if n == 1 else round(34 + 60 * i / (n - 1)))
             evs += [(0, 0, bytes([0xC0 | ch, part.program])), (0, 0, bytes([0xB0 | ch, 10, pan]))]
             for t, value in perform.pedal_events(part):
-                evs.append((round(t * PPQ), 0, bytes([0xB0 | ch, 64, value])))
+                evs.append((round(at(t) * PPQ), 0, bytes([0xB0 | ch, 64, value])))
         for t, _, program in part.registrations:
             if program is not None:
-                evs.append((round(t * PPQ), 0, bytes([0xC0 | ch, program])))
+                evs.append((round(at(t) * PPQ), 0, bytes([0xC0 | ch, program])))
         dyn = perform.Dynamics(part)
         for t, note in part.events():
             if note.is_rest:
                 continue
-            on = round(t * PPQ)
-            off = round((t + perform.sounding_dur(note)) * PPQ)
+            on = round(at(t) * PPQ)
+            off = round(at(t + perform.sounding_dur(note)) * PPQ)
             vel = perform.velocity(dyn, part, t, note)
             for m in sorted({p.midi + c for p in note.pitches for c in part.couplers if 0 <= p.midi + c < 128}):
                 evs.append((on, 2, bytes([0x90 | ch, m, vel])))

@@ -2,9 +2,12 @@
 
     badmidi piece.py                     melody-major view (default)
     badmidi piece.py grid --bars 5-8     harmony-major view of bars 5..8
+    badmidi piece.py melody --section B  any view: --section B or B-C instead of --bars
     badmidi piece.py check               is it what you meant? bar counts, overlaps, ranges
     badmidi piece.py lens --bars 9-16    what the voices are doing: passing notes,
                                          suspensions, parallels, crossings (--kinds susp,parallel)
+                                         (collapsed by default: 'bars 12-19: same as 11'; --all lists every bar)
+    badmidi piece.py form [--every 8]    the piece in broad strokes: one row per section
     badmidi piece.py midi [-o out.mid]   write a MIDI file
     badmidi piece.py wav  [-o out.wav]   render audio with fluidsynth
     badmidi piece.py ly                  print LilyPond source
@@ -59,9 +62,14 @@ def main(argv: list[str] | None = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("piece", help="python file that builds a Score")
     ap.add_argument("view", nargs="?", default="melody",
-                    choices=["melody", "grid", "check", "lens", "midi", "wav", "ly", "pdf", "png", "all"])
+                    choices=["melody", "grid", "check", "lens", "form", "midi", "wav", "ly", "pdf", "png", "all"])
     ap.add_argument("-o", "--out", help="output path for midi/wav (default: next to the piece)")
     ap.add_argument("--bars", help="bar range, e.g. 5-8 or 12")
+    ap.add_argument("--section", help="a section label (B) or span (B-C), instead of --bars")
+    ap.add_argument("--every", type=int, help="form: one row per N bars instead of per section")
+    ap.add_argument("--collapse", action="store_true",
+                    help="melody, grid: fold bars identical to the one before into 'bars 12-19: same as 11'")
+    ap.add_argument("--all", action="store_true", help="lens: list every bar, don't collapse repeats")
     ap.add_argument("--parts", help="comma-separated part names to show")
     ap.add_argument("--width", type=int, default=4, help="bars per line in the melody view")
     ap.add_argument("--step", help="grid: also add a row every STEP (e.g. e, s, 0.5)")
@@ -73,16 +81,27 @@ def main(argv: list[str] | None = None) -> int:
     score = load_score(args.piece, args.score)
     parts = args.parts.split(",") if args.parts else None
     bars = _bars(args.bars)
+    if args.section and args.bars:
+        sys.exit("give --bars or --section, not both")
+    if args.section:
+        try:
+            bars = score.section_bars(args.section)
+        except ValueError as e:
+            sys.exit(str(e))
+    where = dict(bars=bars)
     stem = os.path.splitext(args.piece)[0]
 
     if args.view in ("check", "all"):
         print(score.check())
     if args.view == "lens":
-        print(score.lens(bars=bars, parts=parts, kinds=args.kinds.split(",") if args.kinds else None))
+        print(score.lens(**where, parts=parts, kinds=args.kinds.split(",") if args.kinds else None,
+                         collapse=not args.all))
+    if args.view == "form":
+        print(score.form(**where, every=args.every, parts=parts))
     if args.view in ("melody", "all"):
-        print(score.melody(bars=bars, parts=parts, width=args.width))
+        print(score.melody(**where, parts=parts, width=args.width, collapse=args.collapse))
     if args.view in ("grid", "all"):
-        print(score.grid(bars=bars, parts=parts, step=_step(args.step)))
+        print(score.grid(**where, parts=parts, step=_step(args.step), collapse=args.collapse))
     if args.view in ("midi", "all"):
         out = args.out if args.view == "midi" and args.out else stem + ".mid"
         score.write_midi(out)

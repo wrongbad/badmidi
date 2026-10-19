@@ -166,6 +166,7 @@ class Part:
         self.couplers = couplers
         self.channel = channel or name
         self.registrations: list[tuple[Fraction, str, int | None]] = []
+        self.drifts: list[Drift] = []
         self.pan = pan
         self.placements: list[tuple[Fraction, Motif]] = []
         self._last_end = Fraction(0)
@@ -175,6 +176,26 @@ class Part:
 
     def then(self, *material) -> "Part":
         return self._place(self._last_end, material)
+
+    def loop(self, bar: int, *material, times: int = 2, beat=1) -> "Part":
+        """Place `material` `times` times in a row, starting at bar N. It plays
+        and shows (melody, grid, lens, check) fully expanded; the engraving
+        prints it once inside a repeat marked x8 when every part agrees on
+        the span, and writes it out otherwise (check says which).
+
+            p.loop(5, "E4.e F4.e G4.e A4.e | ", times=8)
+        """
+        body = Motif(*material)
+        if times < 2:
+            raise ValueError("loop() needs times >= 2; use at() to place something once")
+        if not body.dur:
+            raise ValueError("loop() needs material with some length")
+        if any(isinstance(it, Bar) and it.number is not None for it in body.items):
+            raise ValueError("loop() material can't contain numbered anchors (|N): they name one bar, "
+                             "and the material is played several times")
+        t = self.score.time(bar, beat)
+        self.score.loops.append(Loop(self, t, body.dur, times))
+        return self._place(t, [body] * times)
 
     def _place(self, t: Fraction, material) -> "Part":
         # one placement per argument: check() treats a motif that enters
@@ -202,6 +223,30 @@ class Part:
             program = INSTRUMENTS[program][0]
         self.registrations.append((self.score.time(bar, beat), text, program))
         self.registrations.sort(key=lambda r: r[0])
+        return self
+
+    def drift(self, start, end, ahead=Fraction(1, 4), text: str | None = None) -> "Part":
+        """Playback only: between `start` and `end` (a bar or (bar, beat), as
+        in score.rit) this part gradually gets `ahead` quarter notes ahead of
+        its written time (negative: behind), then stays that far off until
+        another drift moves it again. The score, its views and the engraving's
+        rhythms are unchanged; the staff gets `text` over a dashed line.
+
+            b.drift(9, 41, ahead=Fraction(1, 4))        # a sixteenth ahead by bar 41
+            b.drift(41, 49, ahead=-Fraction(1, 4))      # and back again
+
+        A sustained tempo ratio r over the span is ahead = (r - 1) * length."""
+        s0, s1 = self.score.pos(start), self.score.pos(end)
+        if s1 <= s0:
+            raise ValueError("drift() needs an end after its start")
+        d = Drift(s0, s1, _exact(ahead), text)
+        self.drifts.append(d)
+        try:
+            from .perform import warp
+            warp(self)
+        except ValueError:
+            self.drifts.remove(d)
+            raise
         return self
 
     def mark(self, bar: int, *marks, beat=1) -> "Part":
@@ -261,6 +306,50 @@ class Part:
         return f"Part({self.name!r}, {self.instrument!r})"
 
 
+class Drift:
+    """A span over which a part's playback gets `ahead` quarter notes ahead
+    of (or, negative, behind) the written time. See Part.drift."""
+    __slots__ = ("start", "end", "ahead", "text")
+
+    def __init__(self, start: Fraction, end: Fraction, ahead: Fraction, text: str | None = None):
+        self.start, self.end, self.ahead = start, end, ahead
+        self.text = text or f"gradually {'accel.' if ahead > 0 else 'rit.'} (to {ahead_name(ahead)})"
+
+    def __repr__(self) -> str:
+        return f"Drift({self.start}, {self.end}, {self.ahead})"
+
+
+def ahead_name(ahead: Fraction) -> str:
+    """'1/16 ahead': the offset as a note value (a quarter is 1/4)."""
+    v = abs(ahead) / 4
+    return f"{v.numerator}/{v.denominator}" + (" ahead" if ahead > 0 else " behind")
+
+
+class Loop:
+    """A passage placed `times` times in a row by Part.loop(): where it
+    starts, how long one pass is. Only a statement of intent; the notes are
+    ordinary placements."""
+    __slots__ = ("part", "start", "body", "times")
+
+    def __init__(self, part: Part, start: Fraction, body: Fraction, times: int):
+        self.part, self.start, self.body, self.times = part, start, body, times
+
+    @property
+    def end(self) -> Fraction:
+        return self.start + self.body * self.times
+
+
+class Section:
+    """A named stretch of the piece starting at a bar: a rehearsal mark."""
+    __slots__ = ("bar", "label", "description")
+
+    def __init__(self, bar: int, label: str, description: str | None = None):
+        self.bar, self.label, self.description = bar, label, description
+
+    def __repr__(self) -> str:
+        return f"Section({self.bar}, {self.label!r})"
+
+
 class TempoMark:
     """A tempo indication at a point (text and/or metronome mark), or a
     gradual change over a span (rit./accel. to a target tempo)."""
@@ -299,6 +388,8 @@ class Score:
         self.key = parse_key(key)
         self.parts: list[Part] = []
         self.tempo_marks: list[TempoMark] = [TempoMark(Fraction(0), tempo_text, tempo)]
+        self.loops: list[Loop] = []
+        self.sections: list[Section] = []
 
     def part(self, name: str, instrument: str | None = None, **kw) -> Part:
         if any(p.name == name for p in self.parts):
@@ -347,6 +438,34 @@ class Score:
 
     def accel(self, start, end, to: float, text: str = "accel.") -> "Score":
         return self.rit(start, end, to, text)
+
+    # --- form ---------------------------------------------------------------
+
+    def section(self, bar: int, label: str, description: str | None = None) -> "Score":
+        """A rehearsal mark at bar N: score.section(33, "B", "the pattern thins").
+        Sections run to the next one (the last to the end); views take
+        --section B or B-C instead of --bars, and form() lists them."""
+        label = str(label)
+        if bar < 1:
+            raise ValueError(f"bars are numbered from 1 (got {bar})")
+        if any(s.label == label for s in self.sections):
+            raise ValueError(f"duplicate section label {label!r}")
+        if any(s.bar == bar for s in self.sections):
+            raise ValueError(f"bar {bar} already starts a section")
+        self.sections.append(Section(bar, label, description))
+        self.sections.sort(key=lambda s: s.bar)
+        return self
+
+    def section_bars(self, spec: str) -> tuple[int, int]:
+        """(first bar, last bar) of a section label "B" or a span "B-C"."""
+        names = {s.label: i for i, s in enumerate(self.sections)}
+        a, b = (spec, spec) if spec in names else (spec.partition("-")[0], spec.partition("-")[2] or spec)
+        if a not in names or b not in names or names[a] > names[b]:
+            known = ", ".join(s.label for s in self.sections) or "none defined"
+            raise ValueError(f"no section {spec!r} (sections: {known})")
+        i = names[b] + 1
+        last = self.sections[i].bar - 1 if i < len(self.sections) else self.bars
+        return self.sections[names[a]].bar, last
 
     def __getitem__(self, name: str) -> Part:
         for p in self.parts:
@@ -488,6 +607,10 @@ class Score:
     def lens(self, **kw) -> str:
         from .views import lens
         return lens(self, **kw)
+
+    def form(self, **kw) -> str:
+        from .views import form
+        return form(self, **kw)
 
     def lilypond(self) -> str:
         from .lilypond import lilypond

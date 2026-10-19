@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from contextlib import contextmanager
 from fractions import Fraction
-from typing import Callable, Iterable
+from typing import Callable, Iterable, NamedTuple
 
 SHARP_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 FLAT_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
@@ -99,14 +99,28 @@ def _duration(code: str) -> tuple[Fraction, tuple[int, int] | None]:
 
 
 _TUPLET_CODES: dict[Fraction, str] = {}
+_TUPLET_RATIOS: dict[Fraction, tuple[int, int]] = {}
 for _n in (3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15):      # first spelling wins: s3 before e6
     for _b in "whqest":
         _TUPLET_CODES.setdefault(duration(f"{_b}{_n}"), f"{_b}{_n}")
-for _n in range(2, 16):                                 # then explicit ratios: q5:3
-    for _sp in range(1, 16):
-        for _b in "whqest":
-            if _sp != _n:
-                _TUPLET_CODES.setdefault(duration(f"{_b}{_n}:{_sp}"), f"{_b}{_n}:{_sp}")
+        _TUPLET_RATIOS.setdefault(duration(f"{_b}{_n}"), (_n, tuplet_space(_n)))
+# then explicit ratios (q5:3). Notes squeezed into more than their space (12:11)
+# come before notes stretched (6:11), so a length with no tuplet of its own is
+# written as the compressed ratio: s12:11, not t6:11.
+for _squeeze in (True, False):
+    for _n in range(2, 16):
+        for _sp in range(1, 16):
+            if (_n > _sp) == _squeeze and _n != _sp:
+                for _b in "whqest":
+                    _d = duration(f"{_b}{_n}:{_sp}")
+                    _TUPLET_CODES.setdefault(_d, f"{_b}{_n}:{_sp}")
+                    _TUPLET_RATIOS.setdefault(_d, (_n, _sp))
+
+
+def derived_tuplet(d: Fraction) -> tuple[int, int] | None:
+    """The tuplet ratio a length is written with when it has none of its own
+    (the one dur_suffix prints): 11/48 -> (12, 11); None for plain values."""
+    return _TUPLET_RATIOS.get(Fraction(d))
 
 
 def as_duration(x) -> Fraction:
@@ -503,6 +517,19 @@ CRESC, DIM, HAIRPIN_END = Mark("cresc"), Mark("dim"), Mark("end")
 PED, PED_UP = Mark("ped"), Mark("pedup")
 
 
+def _offset(x) -> Fraction:
+    """A non-negative length in quarter notes (0 allowed)."""
+    return as_duration(x) if x else Fraction(0)
+
+
+class Event(NamedTuple):
+    """A note and the markings written just before it (they belong to its
+    onset): what restructuring moves around together. `for note, marks in
+    m.events()` unpacks it."""
+    note: Note
+    marks: tuple = ()
+
+
 class Motif:
     """An immutable sequence of notes (and bar anchors). Every transformation
     returns a new Motif, so ideas can be named and developed like values:
@@ -599,6 +626,176 @@ class Motif:
 
     def map_pitches(self, fn: Callable[[Pitch], Pitch]) -> "Motif":
         return self.map(lambda n: n.map_pitches(fn))
+
+    def map_timed(self, fn: Callable[[Note, int, Fraction], Note]) -> "Motif":
+        """Like map, but fn(note, i, t) also gets the note's index (rests
+        count) and its onset in quarter notes from the start of the motif.
+        Bars and markings stay where they are."""
+        timed = iter(enumerate(self.timed()))
+
+        def go(n: Note) -> Note:
+            i, (t, _) = next(timed)
+            return fn(n, i, t)
+        return self.map(go)
+
+    def timed(self) -> list[tuple[Fraction, Note]]:
+        """(onset, note) for every note and rest; onset in quarter notes from the start."""
+        out, t = [], Fraction(0)
+        for n in self.notes:
+            out.append((t, n))
+            t += n.dur
+        return out
+
+    def pipe(self, fn: Callable, *args, **kw):
+        """fn(self, *args, **kw): your own transformations chain like the
+        built-ins: theme.pipe(additive, 3).pipe(rebar_it).transpose(5)."""
+        return fn(self, *args, **kw)
+
+    # --- restructuring ----------------------------------------------------
+
+    def events(self) -> list[Event]:
+        """The notes as Events (note, marks written just before it), barlines
+        dropped. Marks after the last note are not in the list; restructure()
+        keeps them at the end."""
+        out, pending = [], []
+        for it in self.items:
+            if isinstance(it, Mark):
+                pending.append(it)
+            elif isinstance(it, Note):
+                out.append(Event(it, tuple(pending)))
+                pending = []
+        return out
+
+    @property
+    def tail(self) -> tuple[Mark, ...]:
+        """Markings after the last note (a final pedal lift, a hairpin end)."""
+        out = []
+        for it in self.items:
+            if isinstance(it, Note):
+                out = []
+            elif isinstance(it, Mark):
+                out.append(it)
+        return tuple(out)
+
+    @classmethod
+    def from_events(cls, events: Iterable, tail: Iterable[Mark] = ()) -> "Motif":
+        """Build a motif from Events (or bare Notes), each marking its note's
+        onset. The result has no barlines: rebar() or expect() puts them back.
+        A tie that no longer meets a note of the same pitch is dropped."""
+        evs = [e if isinstance(e, Event) else Event(e) for e in events]
+        items: list = []
+        for i, (note, marks) in enumerate(evs):
+            if note.tied and i + 1 < len(evs) and evs[i + 1].note.pitches != note.pitches:
+                note = note.with_tied(False)
+            items.extend(marks)
+            items.append(note)
+        return cls(*items, *tail)
+
+    def restructure(self, fn: Callable[[list[Event]], Iterable]) -> "Motif":
+        """Reorder, drop, repeat or insert notes with fn(events) -> events;
+        each note keeps its markings, and marks after the last note stay at
+        the end. Barlines are dropped (rebar() them):
+
+            m.restructure(lambda evs: evs[::2])
+            m.restructure(lambda evs: [e for e in evs if not e.note.is_rest])"""
+        return Motif.from_events(fn(self.events()), self.tail)
+
+    def rotate(self, n: int = 1) -> "Motif":
+        """Start n notes in (negative: n back from the end); the notes before
+        move to the end. Markings travel with their notes; barlines are
+        dropped. A note's tie into the next stays only where they still meet."""
+        evs = self.events()
+        if not evs:
+            return self
+        k = n % len(evs)
+        if k and evs[k - 1].note.tied:       # its follower is now elsewhere
+            evs[k - 1] = evs[k - 1]._replace(note=evs[k - 1].note.with_tied(False))
+        return Motif.from_events(evs[k:] + evs[:k], self.tail)
+
+    def rebar(self, meter=(4, 4), start=0) -> "Motif":
+        """Put barlines back: replace any anchors with a plain | every bar,
+        splitting notes that cross one into tied pieces (rests into rests).
+        `start` is how far into the bar the motif begins, in quarter notes
+        (3 for a pickup on beat 4 of 4/4). Ends with | if it ends on a barline.
+        Markings stay with the onset they were written at; a split note keeps
+        its articulations on the first piece and a fermata on the last."""
+        from .score import Meter
+        m = Meter.parse(meter)
+        if m.free is not None:
+            raise ValueError("rebar() needs a metered bar, not a free one")
+        bar_len, start = m.bar_len, _offset(start)
+        if not 0 <= start < bar_len:
+            raise ValueError(f"start must be inside the bar: 0 <= start < {fmt_number(bar_len)} quarters")
+        out: list = []
+        pending: list = []
+        room = bar_len - start
+
+        def settle():
+            nonlocal room
+            if room == 0:
+                out.append(BAR)
+                room = bar_len
+        for it in self.items:
+            if isinstance(it, Mark):
+                pending.append(it)
+            elif isinstance(it, Note):
+                settle()
+                out.extend(pending)
+                pending = []
+                sizes = []
+                left = it.dur
+                while left > room:
+                    sizes.append(room)
+                    left -= room
+                    room = bar_len
+                sizes.append(left)
+                room -= left
+                for i, d in enumerate(sizes):
+                    if len(sizes) == 1:
+                        out.append(it)
+                        break
+                    last = i == len(sizes) - 1
+                    art = (it.art.replace("@", "") if i == 0 else "") + ("@" if last and "@" in it.art else "")
+                    out.append(Note(it.pitches, d, not it.is_rest and (not last or it.tied), art,
+                                    it.tuplet if d not in WRITTEN else None))
+                    if not last:
+                        out.append(BAR)
+        settle()
+        out.extend(pending)
+        return Motif(*out)
+
+    def expect(self, bars: int | None = None, meter=(4, 4), start=0, dur=None) -> "Motif":
+        """Raise NotationError now if the motif isn't the length (or its
+        barlines aren't where) you meant; returns the motif otherwise, so it
+        chains. The message is the one check gives:
+
+            gen(5).expect(bars=2, meter="3/4")    # bars 1-2 of 3/4, from `start`
+            gen(5).expect(dur=6)                  # six quarter notes
+
+        Barlines in the motif are checked against the meter too."""
+        from .score import Meter, Score
+        from . import views
+        mt = Meter.parse(meter)
+        score = Score(meter=mt)
+        if dur is None and bars is None:
+            raise ValueError("expect() needs bars= or dur=")
+        if any(isinstance(it, Bar) for it in self.items):
+            beat = 1 + _offset(start) / mt.beat_len
+            score.part("m").at(1, self, beat=beat)
+            errors = [msg for lv, _, _, msg in views._issues(score) if lv == "ERROR"]
+            if errors:
+                raise NotationError(errors[0])
+        have = self.dur
+        if dur is not None:
+            want, what = as_duration(dur), f"{fmt_number(as_duration(dur))} quarters"
+        else:
+            want, what = bars * mt.bar_len - _offset(start), f"{bars} bar{'s' if bars != 1 else ''} of {mt.text}"
+        if have != want:
+            off = have - want
+            raise NotationError(
+                f"motif has {views._beats(score, have, 1)}, expected {views._beats(score, want, 1)} ({what}): "
+                f"{views._amount(abs(off))} too {'long' if off > 0 else 'short'}")
+        return self
 
     def transpose(self, n: int, scale=None) -> "Motif":
         """Shift by n semitones, or by n scale steps if a scale/key is given.

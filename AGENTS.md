@@ -24,7 +24,7 @@ A piece is a Python file that builds a `Score` named `score`.
 2. `badmidi piece.py check`: fix every ERROR. Errors are about notation, not
    taste: miscounted bars, wrong bar anchors, overlapping notes in one part.
    Fix the first error in a part first; the rest are often the same miscount.
-3. `badmidi piece.py grid --bars 9-16`: read the harmony. Every row is an
+3. `badmidi piece.py grid --bars 9-16` (or `--section B`): read the harmony. Every row is an
    onset, labelled with chord symbol, roman numeral and set class.
 4. `badmidi piece.py lens --bars 9-16`: read the counterpoint: each
    dissonance named by how it moves, plus parallels and crossings. It's a
@@ -84,7 +84,7 @@ views print it, so view output can be pasted back as input.
 | `E4.e3` | `E4.e3` | triplet eighth |
 | `E4.s5`, `E4.e7` | same | any tuplet: n in the time of the power of two below n |
 | | `E4.q5:3`, `E4.q2:3` | explicit ratio (5 in 3; a duplet in 6/8); printed and engraved as written |
-| `E4 * 1.5` | `E4*1.5`, `E4*(5/3)` | any length in quarter notes |
+| `E4 * 1.5` | `E4*1.5`, `E4*(5/3)` | any length in quarter notes; one that is a tuplet of a plain value prints as that tuplet (`E4.s12:11` for 11/48), and engraves as a bracket (`\tuplet 12/11`) |
 | `R.q`, `R * 3` | `R.q`, `R*3` | rest |
 | `(C4 & E4 & G4).h` | `[C4 E4 G4].h` | chord |
 | `E4.h.tie` | `E4.h~` | tie into the next note of the same pitch |
@@ -184,6 +184,42 @@ A part is one line: its notes can't overlap. For two voices on one staff
 (a fugue in the right hand, a held note under a moving one) give the second
 voice its own part with `rh.voice("alto")`.
 
+Loops (minimalism, ostinati) play fully expanded and engrave as a repeat:
+
+```python
+p.loop(5, "E4.e F4.e G4.e A4.e B4.e A4.e | ", times=8)   # bars 5-12; also takes Motifs and several arguments
+p.loop(13, rot, times=4).then("E4.w |")                  # chains like at()
+```
+
+Every view and `check` see all `times` passes; a loop of one bar at bar 5
+with `times=8` occupies bars 5-12, and the engraving prints it once as
+`\repeat volta 8` with "×8" above the top staff. Bar numbers in the
+engraving keep counting every pass (the bar after it is printed as 13), so
+they always match the views. LilyPond's MIDI is verified with the repeats
+unfolded. A loop is engraved as a repeat only when it is true to every
+staff, otherwise the whole span is written out and `check` says why (a NOTE,
+not an error):
+- one pass starts and ends on barlines, in a single meter, no free bars;
+- **every part** is the same in each pass (or silent): parts may play
+  different things, each repeating, but a part that carries on with something
+  else, or loops a different span, makes the others' loops written out;
+- no tempo change, section, registration, drift or marking (other than at the first
+  beat of the span) falls inside it;
+- loops don't overlap (the earlier one wins).
+
+Material can't contain numbered anchors (`|N`), since they name one bar.
+Several parts looping the same span: give each the same `bar` and `times`.
+
+Sections are rehearsal marks and a handle for the views:
+
+```python
+score.section(9, "B", "the second marimba slips")   # engraved as a boxed B with the text above
+```
+
+A section runs to the next one. `--section B` or `--section B-C` replaces
+`--bars` in `melody`, `grid`, `lens` and `form` (in Python:
+`score.melody(section="B")`). Labels in the views print as `9 [B]`.
+
 Tempo and meter are score-level:
 
 ```python
@@ -193,6 +229,25 @@ score.meter_change(9, "3/4")               # also (3, 4), "6/8"
 score.meter_change(13, "2+2+3/8")          # additive: printed 2+2+3 over 8, grouped that way
 score.free_bar(20, 11)                     # unmetered bar of 11 quarters; then the meter resumes
 ```
+
+Per-part drift is playback only, for phasing, tempo canons and independent
+layers (Reich, Nancarrow, Ives):
+
+```python
+b.drift(9, 41, ahead=Fraction(1, 4))       # b sounds up to a sixteenth ahead of its written time by bar 41
+b.drift(41, 49, ahead=-Fraction(1, 4))     # ...and back; negative is behind
+b.drift((9, 3), 41, ahead=.5, text="gradually pushing")   # positions as in rit(); own text
+```
+
+Over the span `b` gets `ahead` quarters ahead (a linear ramp, so a steady
+tempo ratio r is `(r - 1) * length`), then stays that far off until another
+drift moves it. Only the MIDI/wav timing of that part (notes, its pedal and
+registration changes) warps; the score, `melody`/`grid`/`lens`/`check` and the
+engraved rhythms stay in written time, and LilyPond verification still
+compares the written rhythm. The staff prints the text ("gradually accel. (to
+1/16 ahead)") over a dashed line, and `check` notes each span. A drift that
+would make a part play backwards is an error at call time. `voice()` parts
+drift separately.
 
 Time is in quarter notes, as exact `Fraction`s.
 - `score.time(bar, beat)` gives the time of a bar and beat, and `score.position(t)` gives `(bar, beat)` back.
@@ -225,7 +280,14 @@ concatenates; `m * 3` repeats; `m[0]`, `m[:2]` index notes; `m.text()` and
 | `double(-12)`, `double(12, 24)` | add the pitches again at intervals |
 | `rhythm(1, .5, .5)` / `rhythm(other)` | new durations, same pitches (cycled) |
 | `with_pitches(E4, G4)` / `with_pitches(other)` | new pitches, same rhythm (cycled) |
-| `map(fn)`, `map_pitches(fn)` | anything else |
+| `map(fn)`, `map_pitches(fn)` | per-note: fn(note) -> note |
+| `map_timed(fn)` | fn(note, i, t) -> note: index (rests count) and onset in quarters |
+| `rotate(n)` | start n notes in, the rest to the end; markings travel; unbarred |
+| `events()`, `Motif.from_events(evs, tail)`, `restructure(fn)` | notes as `Event(note, marks)`; reorder/drop/insert with marks travelling; unbarred |
+| `timed()` | `[(onset, note)]` |
+| `pipe(fn, *args)` | `fn(m, *args)`, so your transforms chain |
+| `rebar(meter, start=0)` | put `\|` back every bar, splitting notes with ties |
+| `expect(bars=N, meter=..)` / `expect(dur=..)` | raise now, with check's message, if the length or barlines are off; else returns the motif |
 
 ```python
 isorhythm("C4 D4 F4 G4 A4", [1, .5, .5, 2])    # color over talea, until both cycles end together
@@ -250,25 +312,70 @@ the score's key.
 A chromatic inversion around a point between two notes: invert around a
 note, then transpose, e.g. `invert(around=A4).transpose(-9)` mirrors C↔A.
 
+## Writing your own transformations
+
+The built-ins are a few generic moves; process ideas (additive, phase,
+beat-building) are yours to write.
+- A transform is a function `Motif -> Motif` (extra arguments after it).
+  Chain with `pipe`: `cell.pipe(additive).pipe(shift, 3).transpose(5)`.
+- Per-note work: `map`, `map_timed`. Reordering, dropping, inserting:
+  `restructure` or `events()` / `Motif.from_events`. A mark written before a
+  note (dynamic, hairpin, pedal, text, and the articulations on the note)
+  belongs to that note's onset and travels with it; marks after the last note
+  stay at the end. Restructured material is unbarred.
+- Put barlines back with `rebar(meter)` and assert the length with
+  `expect(bars=N)`, so `check` still catches a miscount in generated music.
+- Keep shared ideas in an `ideas.py` next to your pieces and import it
+  (`from ideas import additive`); run `badmidi` from that directory.
+
+```python
+# phase blocks: the cell rotated one note further each time
+blocks = [cell.rotate(k).rebar("12/16") * 4 for k in range(12)]
+
+# Glass additive process: 1, 1-2, 1-2-3, ... of the cell
+def additive(cell):
+    return M(*(cell[:n] for n in range(1, len(cell) + 1))).rebar("4/4")
+
+# Reich beat-building: rests gradually replaced by notes, in the order you choose
+def build(cell, order, n):
+    on = set(order[:n])
+    return cell.map_timed(lambda note, i, t: note if i in on else R * note.dur)
+stages = [build(cell, [0, 4, 8, 2, 6, 10, 1, 5, 9, 3, 7, 11], n).rebar("12/16") * 4
+          for n in range(1, 13)]
+```
+
 ## Views
 
 `badmidi piece.py VIEW [--bars 5-8] [--parts rh,lh]`
 
 - **melody** (default): one line per part, bars in aligned columns, markings
-  inline, bars labelled where the meter changes. Every row is valid string
-  notation.
+  inline, bars labelled where the meter changes (and `[B]` where a section
+  starts). Every row is valid string notation. `--collapse` replaces a run
+  of bars identical to the one before (in every shown part) with
+  `bars 12-19: same as 11`.
 - **grid**: time down, parts across. `|` means still sounding, `.` silent;
   `--step e` adds a fixed grid. Each row ends with chord symbol, roman numeral
   (when the chord is tonal) and set class:
-  `E+  II+  3-12 (048) augmented`.
+  `E+  II+  3-12 (048) augmented`. `--collapse` folds a bar whose rows repeat
+  the bar before into one line, `-- bars 12-19: same as 11 ---`.
+- **form**: one row per section (or per `--every 8` bars; 8 is the default
+  when there are no sections): bars, parts playing (`all`, or which), onsets
+  per beat, lowest-highest pitch, the pitch classes in play with their set
+  class, dynamics in force (all parts, in time order), and what changed since
+  the row above (`+m2`, `pcs +Gs -D`, `density 2.0->1.2`, `register lo +7`,
+  `dyn p->f`). Use it first on a long piece.
 - **check**: notation only. Errors: bar anchors, overlaps. Warnings: ranges,
-  stray pedal lifts. Notes: an incomplete last bar, a hairpin that runs to the end.
+  stray pedal lifts. Notes: an incomplete last bar, a hairpin that runs to the
+  end, a loop that is engraved written out rather than as a repeat.
 - **lens**: what the voices are doing (below). `--kinds susp,parallel` filters.
+  Bars with exactly the observations of the bar before are folded into
+  `-- bars 12-19: same as 11` by default; `--all` lists every one.
 - **pdf / png / ly**: engraving (see the loop).
 - **midi / wav / all**.
 
-In Python these are `score.melody()`, `score.grid()`, `score.check()` and
-`score.lens()`, and `score.observe()` returns the lens as `Observation`
+In Python these are `score.melody()`, `score.grid()`, `score.form()`,
+`score.check()` and `score.lens()` (keywords `bars=(5, 8)`, `section="B"`,
+`collapse=True/False`), and `score.observe()` returns the lens as `Observation`
 objects with `.t`, `.where`, `.kind` and `.detail`.
 
 ## The lens
@@ -332,8 +439,25 @@ calm[0].place(soprano, alto, 17)       # subject at bar 17 in the soprano, the c
   7/8), and a free bar's beats are quarters.
 - `retrograde()` drops dynamics, hairpins, pedal and text, because they have
   no meaningful reverse. Put them back with `mark()`.
+- **Restructuring drops barlines.** `rotate`, `restructure` and `from_events`
+  return unbarred music (an old `|` would sit in the wrong place); finish with
+  `rebar(meter)` or `expect(bars=N)`. A tie whose partner moved away is dropped.
+- **Drift is heard, not seen.** `check` notes it, but `grid` and `lens` show
+  written time, where the drifting part still lines up with the others.
 - `invert(around=...)` needs a pitch for its axis. To mirror around the point
   between two notes, invert around one and transpose (see Spelling).
+
+- **A loop engraves as a repeat only if every part agrees on the span.** One
+  part carrying on with something else while another loops, a dynamic or
+  tempo change in the middle of the span, or a pass that isn't whole bars
+  gives written-out engraving. That is a `check` note, not an error; the
+  piece plays and shows identically either way. Put markings at the first beat
+  of a loop, or between loops.
+- `loop()` counts bars in full: `loop(5, one_bar, times=8)` ends at bar 12,
+  and the next thing goes at bar 13. A `|N` anchor inside the material is
+  rejected.
+- Bar numbers in a collapsed view still name the real bars: "bars 12-19:
+  same as 11" means those bars repeat bar 11's content.
 
 ## Adding an example
 
@@ -353,21 +477,24 @@ to look at. Run `python -m unittest discover tests`.
 | `funk_chaconne.py` | organ: a ground bass sequenced into variations, a fugue, registration |
 | `hexachord_fantasia.py` | free-bass accordion: cantus firmus, canon at the 7th, a tritone-answer ricercar with stretto entries mid-bar, divisions on a ground, set-class harmony |
 | `bent_chaconne.py` | violin and two cellos: a ground drifting against itself by isorhythm, a 7/8 variation, a mirror variation by inversion, a mensuration canon of the ground, a free-bar cadenza |
+| `phase_study.py` | two marimbas in 12/16: sections, `loop()` engraved as ×n repeats, a 12:11 tuplet slip bar, then a passage in unison on the page with a playback `drift` out and back; try `form`, `lens`, `grid --collapse` |
 | `wandering_ricercar.py` | clarinet, tenor and baritone sax: modal imitation chosen with `stretti`, generated fauxbourdon in several modes, a galliard on chromatic-mediant chords, additive meters and hemiola throughout |
 
 ## Where things live
 
 ```
-badmidi/core.py      Pitch, Chord, Note, R, Bar, Mark, Motif and its transformations,
+badmidi/core.py      Pitch, Chord, Note, R, Bar, Mark, Event, Motif and its transformations
+                     (restructure, rotate, rebar, expect),
                      the string parser, duration codes, isorhythm
 badmidi/scale.py     key(), Scale: diatonic steps, signatures, spelling, degrees
 badmidi/notes.py     C0..G9 constants
-badmidi/score.py     Score, Part, Meter, the instrument table, time and meter maps
-badmidi/views.py     melody, grid, check, lens; chord naming
+badmidi/score.py     Score, Part (incl. drift), Meter, the instrument table, time and meter maps
+badmidi/views.py     melody, grid, form, check, lens; chord naming
 badmidi/analysis.py  observe() (the lens), pitch-class sets, stretti()
-badmidi/perform.py   markings -> playback: dynamics, hairpins, accents, tempo map, pedal
+badmidi/perform.py   markings -> playback: dynamics, hairpins, accents, tempo map, pedal, per-part drift clock
 badmidi/midi.py      Standard MIDI File writer and reader
 badmidi/lilypond.py  LilyPond export, rendering, and verification against LilyPond's MIDI
+badmidi/loops.py     which Part.loop() spans can be engraved as repeats
 badmidi/render.py    wav through fluidsynth
 badmidi/cli.py       the badmidi command
 ```

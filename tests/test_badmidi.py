@@ -517,6 +517,510 @@ class TestAnalysis(unittest.TestCase):
         self.assertEqual(b.events()[0][0], sc.time(4))
 
 
+CELL = "E4.s Fs4.s B4.s Cs5.s D5.s Fs4.s E4.s Cs5.s B4.s Fs4.s D5.s Cs5.s |"
+needs_lilypond = unittest.skipUnless(shutil.which("lilypond"), "lilypond not installed")
+
+
+class TestTwelveInEleven(unittest.TestCase):
+    """A bar of 12/16 squeezed twelve notes into eleven sixteenths."""
+
+    def score(self):
+        s = Score("Drift", meter=(12, 16))
+        cell = M(CELL)
+        squeezed = cell.unbarred().diminish(Fraction(12, 11))
+        s.part("a", "marimba").at(1, cell, cell, cell)
+        s.part("b", "marimba").at(1, cell, M(squeezed, "R.s |"))      # then a rest bar for the silent bars
+        s.part("c", "marimba").at(5, cell)                            # three bars of rest before it
+        return s
+
+    def test_spelled_as_a_compressed_tuplet(self):
+        m = M(CELL).unbarred().diminish(Fraction(12, 11))
+        self.assertTrue(m.text().startswith("E4.s12:11 Fs4.s12:11"))
+        self.assertEqual(M(m.text()), m)                              # and it reads back
+
+    def test_engraved_as_one_bracket(self):
+        ly = self.score().lilypond()
+        self.assertIn("\\tuplet 12/11 { e'16 fs'16 b'16 cs''16 d''16 fs'16 e'16 cs''16 b'16 fs'16 d''16 cs''16 } r16 |", ly)
+        self.assertNotIn("4*11/48", ly)
+        self.assertNotIn("\\tuplet 3/2 { e'16~ }", ly)
+
+    @needs_lilypond
+    def test_engraves_without_warnings_and_verifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engrave(self.score(), str(Path(tmp) / "d.pdf"))           # raises on warnings or mismatch
+
+    def test_other_tuplets_still_pick_their_own_ratio(self):
+        s = Score(meter=(5, 8))
+        s.part("v").at(1, "C4.s5 " * 5 + "C4.e3 " * 3 + "C4.e5:3 " * 3 + "|")
+        ly = s.lilypond()
+        for snippet in ("\\tuplet 5/4", "\\tuplet 3/2", "\\tuplet 5/3"):
+            self.assertIn(snippet, ly)
+
+
+class TestSections(unittest.TestCase):
+    def score(self):
+        s = Score("S", meter=(4, 4))
+        a, b = s.part("a", "violin"), s.part("b", "cello")
+        a.at(1, "C5.w | E5.w | G5.w | C6.w |")
+        b.at(1, "C3.w |")
+        b.at(5, "C3.w | G2.w |")
+        a.at(5, "p E5.q E5.q E5.h | f R.w |")
+        s.section(1, "A", "opening").section(3, "B").section(5, "C")
+        return s
+
+    def test_section_bars(self):
+        s = self.score()
+        self.assertEqual(s.section_bars("B"), (3, 4))
+        self.assertEqual(s.section_bars("B-C"), (3, 6))
+        self.assertEqual(s.section_bars("C"), (5, 6))
+        with self.assertRaises(ValueError):
+            s.section_bars("Z")
+        with self.assertRaises(ValueError):
+            s.section(3, "X")
+        with self.assertRaises(ValueError):
+            s.section(9, "A")
+
+    def test_views_take_a_section(self):
+        s = self.score()
+        text = s.melody(section="B")
+        self.assertIn("3 [B]", text)
+        self.assertIn("G5.w", text)
+        self.assertNotIn("C5.w", text)
+        self.assertEqual(s.grid(section="B"), s.grid(bars=(3, 4)))
+        self.assertEqual(s.lens(section="C"), s.lens(bars=(5, 6)))
+
+    def test_cli_section_flag(self):
+        import contextlib, io
+        from badmidi.cli import main
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "piece.py"
+            path.write_text("from badmidi import *\nscore = Score(meter=(4,4))\n"
+                            "score.part('violin').at(1, 'C5.w | D5.w | E5.w |')\n"
+                            "score.section(1, 'A').section(3, 'B')\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                main([str(path), "melody", "--section", "B"])
+            self.assertIn("E5.w", out.getvalue())
+            self.assertNotIn("D5.w", out.getvalue())
+            with self.assertRaises(SystemExit):
+                main([str(path), "melody", "--section", "Q"])
+
+    def test_engraved_as_rehearsal_marks(self):
+        ly = self.score().lilypond()
+        self.assertIn('\\mark \\markup { \\box "A" }', ly)
+        self.assertIn('\\box "B"', ly)
+        self.assertIn('\\italic "opening"', ly)
+
+    @needs_lilypond
+    def test_sections_engrave_and_verify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engrave(self.score(), str(Path(tmp) / "s.pdf"))
+
+
+class TestForm(unittest.TestCase):
+    def score(self):
+        s = Score("F", meter=(4, 4), key="C major")
+        a, b = s.part("a", "violin"), s.part("b", "cello")
+        a.at(1, "p C5.q D5.q E5.q F5.q | G5.w |")
+        b.at(3, "f C3.w | G2.w |")
+        a.at(3, "E5.e E5.e E5.e E5.e E5.e E5.e E5.e E5.e | Fs5.w |")
+        s.section(1, "A", "alone").section(3, "B", "joined")
+        return s
+
+    def test_rows_per_section(self):
+        lines = self.score().form().splitlines()
+        row_a = next(l for l in lines if l.startswith("A "))
+        row_b = next(l for l in lines if l.startswith("B "))
+        self.assertIn("1-2", row_a)
+        self.assertIn("a ", row_a + " ")
+        self.assertIn("C5-G5", row_a)
+        self.assertIn("0.6", row_a)                  # 5 onsets in 8 beats
+        self.assertIn("(alone)", "\n".join(lines))
+        self.assertIn("all", row_b)
+        self.assertIn("+b", row_b)                   # the cello enters
+        self.assertIn("lo -", row_b)                 # and the lowest note drops
+        self.assertIn("dyn p->f", row_b)
+        self.assertIn("pcs", row_b)
+
+    def test_every_n_bars_overrides_sections(self):
+        text = self.score().form(every=1)
+        self.assertEqual(sum(1 for l in text.splitlines() if l.startswith("-")), 4)
+        self.assertNotIn("alone", text)
+
+    def test_without_sections_defaults_to_eight_bars(self):
+        s = Score(meter=(4, 4))
+        s.part("v", "violin").at(1, "C5.w | " * 10)
+        rows = [l for l in s.form().splitlines() if l.startswith("-")]
+        self.assertEqual([r.split()[1] for r in rows], ["1-8", "9-10"])
+
+    def test_cli_form(self):
+        import contextlib, io
+        from badmidi.cli import main
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main([str(EXAMPLES / "phase_study.py"), "form"])
+        self.assertIn("the second marimba slips", out.getvalue())
+
+
+class TestRestructuring(unittest.TestCase):
+    marked = M('p C4.q> "x" D4.q E4.q ped F4.q | G4.q *')
+
+    def test_rotate_keeps_markings_with_their_notes(self):
+        self.assertEqual(self.marked.rotate(1).text(), '"x" D4.q E4.q ped F4.q G4.q p C4.q> *')
+        self.assertEqual(self.marked.rotate(-1).text(), 'G4.q p C4.q> "x" D4.q E4.q ped F4.q *')
+        self.assertEqual(self.marked.rotate(5).text(), self.marked.rotate(0).text())
+        self.assertEqual(self.marked.rotate(0).text(), 'p C4.q> "x" D4.q E4.q ped F4.q G4.q *')   # bars dropped
+        self.assertEqual(M().rotate(2), M())
+
+    def test_events_and_restructure(self):
+        evs = self.marked.events()
+        self.assertEqual([e.note.pitch for e in evs], [C4, bm.D4, E4, bm.F4, G4])
+        self.assertEqual(evs[0].marks, (bm.dyn("p"),))
+        self.assertEqual(evs[1].marks, (bm.text("x"),))
+        self.assertEqual(self.marked.tail, (bm.PED_UP,))
+        rev = self.marked.restructure(lambda es: es[::-1])
+        self.assertEqual(rev.text(), 'G4.q ped F4.q E4.q "x" D4.q p C4.q> *')
+        self.assertEqual(len(self.marked.restructure(lambda es: es + es)), 10)
+        self.assertEqual(M.from_events([C4.q, E4.q]).text(), "C4.q E4.q")
+        self.assertEqual(M.from_events(evs[:2], tail=[bm.PED_UP]).text(), 'p C4.q> "x" D4.q *')
+
+    def test_dangling_tie_dropped(self):
+        m = M("C4.q~ C4.q D4.q")
+        self.assertEqual(m.restructure(lambda es: es).text(), "C4.q~ C4.q D4.q")
+        self.assertEqual(m.restructure(lambda es: [es[0], es[2], es[1]]).text(), "C4.q D4.q C4.q")
+        self.assertEqual(m.rotate(1).text(), "C4.q D4.q C4.q")
+
+    def test_timed_and_map_timed(self):
+        m = M("C4.q D4.e R.e E4.h")
+        self.assertEqual([t for t, _ in m.timed()], [0, 1, Fraction(3, 2), 2])
+        got = []
+        self.assertEqual(m.map_timed(lambda n, i, t: got.append((i, t)) or n), m)
+        self.assertEqual(got[-1], (3, 2))
+        self.assertEqual(M("p C4.q D4.q |").map_timed(lambda n, i, t: n.with_dur(1 + i)).text(), "p C4.q D4.h |")
+
+    def test_pipe(self):
+        double = lambda m, k: m * k
+        self.assertEqual(M("C4.q").pipe(double, 3).transpose(2).text(), "D4.q D4.q D4.q")
+        self.assertEqual(M("C4.q").pipe(double, k=2).dur, 2)
+
+
+class TestRebarExpect(unittest.TestCase):
+    def errors(self, motif, beat=1, meter=(4, 4)):
+        s = Score(meter=meter)
+        s.part("p").at(1, motif, beat=beat)
+        return issues(s, "ERROR")
+
+    def test_rebar_splits_with_ties(self):
+        m = M("C4.hd D4.hd E4.h").rebar("4/4")
+        self.assertEqual(m.text(), "C4.hd D4.q~ | D4.h E4.h |")
+        self.assertEqual(self.errors(m), [])
+
+    def test_rebar_marks_stay_and_rests_split(self):
+        m = M('p C4.h R.w@ "x" D4.q ped').rebar("4/4")
+        self.assertEqual(m.text(), 'p C4.h R.h | R.h@ "x" D4.q ped')
+        self.assertEqual(self.errors(m), [])
+
+    def test_rebar_replaces_old_bars(self):
+        self.assertEqual(M("C4.h D4.h | E4.h").rebar("4/4").text(), "C4.h D4.h | E4.h")
+        self.assertEqual(M("C4.h D4.h E4.h F4.h").rebar("2/4").text(), "C4.h | D4.h | E4.h | F4.h |")
+        self.assertEqual(M("C4.q D4.q").rebar("4/4").text(), "C4.q D4.q")
+
+    def test_rebar_pickup_and_other_meters(self):
+        m = M("C4.q D4.h D4.h E4.q").rebar("3/4", start=2)        # begins on beat 3
+        self.assertEqual(m.text(), "C4.q | D4.h D4.q~ | D4.q E4.q")
+        self.assertEqual(self.errors(m, beat=3, meter=(3, 4)), [])
+        m = M("C4.e D4.e E4.e F4.e G4.e A4.e B4.e C5.e").rebar("2+2+3/8")
+        self.assertEqual(m.text().count("|"), 1)
+        with self.assertRaises(ValueError):
+            M("C4.q").rebar("4/4", start=4)
+
+    def test_rebar_fermata_and_articulation_split(self):
+        self.assertEqual(M("C4.q C4.wd>@").rebar("4/4").text(), "C4.q C4.hd>~ | C4.hd@")
+
+    def test_expect(self):
+        m = M("C4.q D4.q E4.q F4.q")
+        self.assertIs(m.expect(bars=1), m)
+        self.assertIs(m.expect(dur=4), m)
+        with self.assertRaisesRegex(NotationError, "an eighth .* too long"):
+            M("C4.q D4.q E4.q F4.q G4.e").expect(bars=1)
+        with self.assertRaisesRegex(NotationError, "too short"):
+            M("C4.w").expect(bars=2, meter="3/4")
+        with self.assertRaisesRegex(NotationError, "a quarter .* too short"):
+            m.expect(dur=5)
+        with self.assertRaisesRegex(NotationError, "bar 1 has .* an eighth .* too long"):
+            M("C4.q D4.q E4.q F4.q G4.e | C4.w").expect(bars=2)
+        M("D4.h E4.q |").expect(bars=1, start=1)                  # a pickup of one beat
+        with self.assertRaises(ValueError):
+            m.expect()
+
+    def test_generated_material_checks(self):
+        cell = M("C4.q D4.q E4.q F4.q")
+        gen = M(*(cell[:n] for n in range(1, 5))).rebar("4/4").expect(dur=10)
+        self.assertEqual(self.errors(gen), [])
+
+
+class TestDrift(unittest.TestCase):
+    def build(self, ahead=Fraction(1, 4)):
+        s = Score("d", meter=(4, 4), tempo=120)
+        a, b = s.part("a", "marimba"), s.part("b", "marimba")
+        for p in (a, b):
+            p.at(1, M("C4.q D4.q E4.q F4.q |") * 8)
+        b.drift(2, 6, ahead=ahead)
+        return s, a, b
+
+    def test_warp_function(self):
+        from badmidi.perform import warp
+        s, a, b = self.build()
+        w = warp(b)
+        self.assertEqual(w(Fraction(4)), 4)
+        self.assertEqual(w(Fraction(12)), 12 + Fraction(1, 8))
+        self.assertEqual(w(Fraction(20)), 20 + Fraction(1, 4))
+        self.assertEqual(w(Fraction(28)), 28 + Fraction(1, 4))       # stays offset
+        self.assertEqual(warp(a)(Fraction(12)), 12)
+
+    def test_midi_is_warped_and_score_is_not(self):
+        s, a, b = self.build()
+        before = [(t, n) for t, n in b.events()]
+        notes = read_notes(midi_bytes(s))
+        ons = sorted(t for t, p, d in notes if t >= 20)
+        # a plays on the beat; b ten bars later is a sixteenth (1/4 quarter) ahead
+        self.assertIn(Fraction(20), ons)
+        self.assertIn(Fraction(21, 1) + Fraction(1, 4), ons)
+        self.assertEqual(before, [(t, n) for t, n in b.events()])
+        self.assertTrue(all(t.denominator == 1 for t, p, d in score_notes(s)))   # written time is whole beats
+
+    def test_behind_and_backwards(self):
+        s, a, b = self.build(ahead=-Fraction(1, 4))
+        notes = read_notes(midi_bytes(s))
+        self.assertIn(Fraction(21) - Fraction(1, 4), [t for t, p, d in notes])
+        with self.assertRaises(ValueError):
+            b.drift(10, 11, ahead=-5)
+        self.assertEqual(len(b.drifts), 1)               # the bad one was not kept
+        with self.assertRaises(ValueError):
+            b.drift(5, 5, ahead=1)
+
+    def test_drift_returns_and_pedal_follows(self):
+        s, a, b = self.build()
+        b.drift(6, 8, ahead=-Fraction(1, 4))
+        from badmidi.perform import warp
+        self.assertEqual(warp(b)(Fraction(40)), 40)
+
+    def test_written_views_unchanged_and_check_notes_it(self):
+        s, a, b = self.build()
+        s2, _, _ = self.build()
+        s2.parts[1].drifts.clear()
+        self.assertEqual(s.melody(), s2.melody())
+        self.assertEqual(s.grid(), s2.grid())
+        notes = [i for i in issues(s, "NOTE") if "drift" in i[3]]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(issues(s, "ERROR"), [])
+        self.assertIn("1/16 ahead", notes[0][3])
+
+    def test_engraving_and_verification(self):
+        s, a, b = self.build()
+        ly = lilypond(s)
+        self.assertIn("gradually accel. (to 1/16 ahead)", ly)
+        self.assertIn("\\startTextSpan", ly)
+        s.parts[1].drifts[0].text = "slipping"
+        self.assertIn('\\italic "slipping"', lilypond(s))
+        d = tempfile.mkdtemp()
+        try:
+            engrave(s, str(Path(d) / "t.pdf"))          # raises if verification fails
+            self.assertTrue((Path(d) / "t.pdf").exists())
+        finally:
+            shutil.rmtree(d)
+        # verification compares the written rhythm, not the warped playback
+        self.assertTrue(verify(s, midi_bytes(s)))          # the warped playback would not pass
+        s.parts[1].drifts.clear()
+        self.assertEqual(verify(s, midi_bytes(s)), [])      # unwarped playback is the written rhythm
+
+    def test_drift_inside_a_loop_writes_it_out(self):
+        s = Score(meter=(4, 4))
+        a, b = s.part("a", "marimba"), s.part("b", "marimba")
+        a.loop(1, "C4.w |", times=4)
+        b.loop(1, "C4.w |", times=4)
+        self.assertIn("repeat volta", lilypond(s))
+        b.drift(2, 4, ahead=0.25)
+        self.assertNotIn("repeat volta", lilypond(s))
+
+
+class TestCollapse(unittest.TestCase):
+    def score(self):
+        s = Score(meter=(4, 4))
+        a, b = s.part("a", "violin"), s.part("b", "cello")
+        a.at(1, "G4.q A4.q E4.q F4.q | " * 6 + "G4.w |")
+        b.at(1, "C3.q D3.q C3.h | " * 6 + "C3.w |")
+        return s
+
+    def test_lens_collapses_by_default(self):
+        s = self.score()
+        text = s.lens()
+        self.assertIn("bars 2-6: same as 1", text)
+        self.assertEqual(text.count("passing"), s.lens(bars=(1, 1)).count("passing"))
+        full = s.lens(collapse=False)
+        self.assertNotIn("same as", full)
+        self.assertGreater(len(full.splitlines()), 3 * len(text.splitlines()) // 2)
+
+    def test_lens_collapse_keeps_whatever_differs(self):
+        s = Score(meter=(4, 4))
+        s.part("a", "violin").at(1, "G4.q A4.q E4.q F4.q | " * 3 + "G4.q A4.q E4.q E4.q | G4.q A4.q E4.q F4.q |")
+        s.part("b", "cello").at(1, "C3.q D3.q C3.h | " * 5)
+        text = s.lens()
+        self.assertIn("bars 2-3: same as 1", text)
+        self.assertIn("-- 4 ", text)
+        self.assertIn("-- 5 ", text)
+
+    def test_grid_collapse(self):
+        s = self.score()
+        text = s.grid(collapse=True)
+        self.assertIn("bars 2-6: same as 1", text)
+        self.assertIn("-- 7 ", text)
+        self.assertNotIn("same as", s.grid())
+        self.assertEqual(s.grid(collapse=True, bars=(7, 7)).count("\n"), s.grid(bars=(7, 7)).count("\n"))
+
+    def test_melody_collapse(self):
+        s = self.score()
+        text = s.melody(collapse=True)
+        self.assertIn("bars 2-6: same as 1", text)
+        self.assertIn("G4.w", text)
+        self.assertNotIn("same as", s.melody())
+
+    def test_cli_flags(self):
+        import contextlib, io
+        from badmidi.cli import main
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "piece.py"
+            path.write_text("from badmidi import *\nscore = Score(meter=(4,4))\n"
+                            "score.part('v','violin').at(1, 'G4.q A4.q E4.q F4.q | ' * 4)\n"
+                            "score.part('c','cello').at(1, 'C3.q D3.q C3.h | ' * 4)\n")
+            def run(*args):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    main([str(path), *args])
+                return out.getvalue()
+            self.assertIn("same as 1", run("lens"))
+            self.assertNotIn("same as", run("lens", "--all"))
+            self.assertNotIn("same as", run("grid"))
+            self.assertIn("same as 1", run("grid", "--collapse"))
+            self.assertIn("same as 1", run("melody", "--collapse"))
+
+
+class TestLoops(unittest.TestCase):
+    def pair(self, a_times=8, b_times=8, b_cell=CELL):
+        s = Score("L", meter=(12, 16))
+        a, b = s.part("a", "marimba"), s.part("b", "marimba")
+        a.loop(1, CELL, times=a_times)
+        b.loop(1, b_cell, times=b_times)
+        return s, a, b
+
+    def test_loops_play_and_show_in_full(self):
+        s, a, b = self.pair()
+        self.assertEqual(s.bars, 8)
+        self.assertEqual(len([e for e in a.events() if not e[1].is_rest]), 8 * 12)
+        self.assertEqual(s.melody().count("E4.s"), 2 * 8 * 2)
+        self.assertEqual(s.time(9), s.end)
+        self.assertEqual(len(read_notes(midi_bytes(s))), 2 * 8 * 12)
+        self.assertEqual(issues(s, "ERROR"), [])
+
+    def test_loop_chains_and_keeps_position(self):
+        s = Score(meter=(4, 4))
+        p = s.part("v", "violin")
+        p.loop(2, "C4.w |", times=3).then("D4.w |")
+        self.assertEqual([s.where(t) for t, _ in p.events()], ["2:1", "3:1", "4:1", "5:1"])
+
+    def test_loop_validation(self):
+        p = Score().part("v", "violin")
+        with self.assertRaises(ValueError):
+            p.loop(1, "C4.w |", times=1)
+        with self.assertRaises(ValueError):
+            p.loop(1, "C4.w |4", times=2)
+        with self.assertRaises(ValueError):
+            p.loop(1, times=2)
+
+    def test_engraved_as_a_repeat(self):
+        s, _, _ = self.pair()
+        ly = s.lilypond()
+        self.assertEqual(ly.count("\\repeat volta 8"), 4)          # global, tempo line, two staves
+        self.assertIn('\\bold "\u00d78"', ly)
+        self.assertIn("\\unfoldRepeats \\music", ly)
+        self.assertEqual(ly.count("e'16 fs'16 b'16 cs''16 d''16 fs'16 e'16 cs''16 b'16 fs'16 d''16 cs''16 |"), 2)
+
+    def test_plain_scores_keep_one_score_block(self):
+        s = Score()
+        s.part("v", "violin").at(1, "C4.w |")
+        ly = s.lilypond()
+        self.assertEqual(ly.count("\\score"), 1)
+        self.assertNotIn("repeat", ly)
+
+    @needs_lilypond
+    def test_repeat_engraving_verifies_against_lilypond(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engrave(self.pair()[0], str(Path(tmp) / "r.pdf"))
+
+    def test_bar_numbers_after_a_repeat_count_every_pass(self):
+        s, a, b = self.pair()
+        a.at(9, CELL)
+        b.at(9, CELL)
+        self.assertIn("\\set Score.currentBarNumber = #9", s.lilypond())
+
+    def test_mismatched_parts_fall_back_to_writing_out(self):
+        s, _, _ = self.pair(b_times=4)
+        s["b"].at(5, CELL.replace("E4.s Fs4.s", "Fs4.s E4.s"), CELL, CELL, CELL)   # not the same as the first four
+        notes = [m for lv, _, w, m in _issues(s) if lv == "NOTE" and "written out" in m]
+        self.assertTrue(notes)
+        self.assertEqual(issues(s, "ERROR"), [])
+        ly = s.lilypond()
+        self.assertEqual(ly.count("\\repeat volta 8"), 0)
+        self.assertEqual(ly.count("\\repeat volta 4"), 4)           # the 4-pass loops the parts share
+
+    def test_parts_may_play_different_things_if_each_repeats(self):
+        rot = CELL.replace("E4.s Fs4.s", "Fs4.s E4.s")
+        s, _, _ = self.pair(b_cell=rot)
+        self.assertEqual(s.lilypond().count("\\repeat volta 8"), 4)
+        self.assertNotIn("written out", check_text(s))
+
+    def test_one_part_looping_while_another_plays_on(self):
+        s = Score(meter=(4, 4))
+        s.part("a", "violin").loop(1, "C5.w |", times=4)
+        s.part("b", "cello").at(1, "C3.w | D3.w | E3.w | F3.w |")
+        self.assertIn("written out", check_text(s))
+        self.assertNotIn("\\repeat", s.lilypond())
+
+    def test_loop_that_is_not_whole_bars(self):
+        s = Score(meter=(4, 4))
+        s.part("a", "violin").loop(1, "C5.h C5.h C5.h", times=4)     # 3 half notes: bars don't line up
+        self.assertIn("barlines", check_text(s))
+        self.assertNotIn("\\repeat", s.lilypond())
+
+    def test_a_dynamic_at_the_start_does_not_spoil_the_repeat(self):
+        s, a, b = self.pair()
+        a.mark(1, "p")
+        self.assertIn("\\repeat volta 8", s.lilypond())
+        a.mark(3, "f")                       # one in the middle does
+        self.assertNotIn("\\repeat volta 8", s.lilypond())
+
+    def test_a_section_inside_a_loop_writes_it_out(self):
+        s, _, _ = self.pair()
+        s.section(1, "A").section(4, "B")
+        self.assertNotIn("\\repeat volta 8", s.lilypond())
+        self.assertIn("written out", check_text(s))
+
+    @needs_lilypond
+    def test_long_loops_engrave_quickly_and_verify(self):
+        import time
+        s = Score("Long", meter=(12, 16))
+        for name in ("a", "b"):
+            s.part(name, "marimba").loop(1, CELL, times=200)
+        with tempfile.TemporaryDirectory() as tmp:
+            t = time.time()
+            engrave(s, str(Path(tmp) / "long.pdf"))
+            self.assertLess(time.time() - t, 8)
+
+
+def check_text(score):
+    return score.check()
+
+
 class TestExamples(unittest.TestCase):
     def test_examples_check_clean_and_round_trip(self):
         files = sorted(EXAMPLES.glob("*.py"))
