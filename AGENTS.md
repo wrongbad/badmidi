@@ -464,9 +464,10 @@ calm[0].place(soprano, alto, 17)       # subject at bar 17 in the soprano, the c
 Examples in `examples/` are part of the test suite. Each must define
 `score`, pass `check` with no errors, engrave and verify, and survive a
 round trip through the melody view. Start it with a docstring that lists
-what happens in which bars, and the commands worth running. Keep the `.py`,
-`.pdf` and `.mid` (`.wav` is git-ignored); delete any `png` pages you made
-to look at. Run `python -m unittest discover tests`.
+what happens in which bars, and the commands worth running. Only the `.py`
+goes in git: `.pdf`, `.mid` and `.wav` are git-ignored and regenerated on
+demand; delete any `png` pages you made to look at. Run
+`python -m unittest discover tests`.
 
 | example | shows |
 |---|---|
@@ -479,6 +480,10 @@ to look at. Run `python -m unittest discover tests`.
 | `bent_chaconne.py` | violin and two cellos: a ground drifting against itself by isorhythm, a 7/8 variation, a mirror variation by inversion, a mensuration canon of the ground, a free-bar cadenza |
 | `phase_study.py` | two marimbas in 12/16: sections, `loop()` engraved as ×n repeats, a 12:11 tuplet slip bar, then a passage in unison on the page with a playback `drift` out and back; try `form`, `lens`, `grid --collapse` |
 | `wandering_ricercar.py` | clarinet, tenor and baritone sax: modal imitation chosen with `stretti`, generated fauxbourdon in several modes, a galliard on chromatic-mediant chords, additive meters and hemiola throughout |
+| `chromatic_fugue.py` | six-voice fugue for winds and strings: a lament-tetrachord subject, tonal answer, a countersubject in two shapes |
+| `ember_chaconne.py` | string quartet: a descending-tetrachord ground varied eight times, built up to a climax and a Picardy close |
+| `mirror_chaconne.py` | string quartet: a chromatic ground read upright, inverted, backwards and against itself; invertible counterpoint |
+| `woven_chaconne.py` | string quartet: a fixed harmony woven from interlocking rhythms (hemiola and other cross-rhythms) |
 
 ## Where things live
 
